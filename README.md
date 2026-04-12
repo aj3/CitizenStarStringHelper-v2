@@ -6,7 +6,7 @@ It checks the configured StarStrings GitHub repository for releases, installs up
 
 ## Download
 
-**[Download the latest Citizen StarString Helper.exe](https://github.com/aj3/CitizenStarStringHelper/releases/latest/download/Citizen.StarString.Helper.exe)**
+**[Download the latest Citizen StarString Helper.exe](https://github.com/aj3/CitizenStarStringHelper-v2/releases/download/v2.0.1/Citizen.StarString.Helper.exe)**
 
 Or browse all releases: [GitHub Releases](https://github.com/aj3/CitizenStarStringHelper/releases)
 
