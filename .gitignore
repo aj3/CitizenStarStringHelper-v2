@@ -1,0 +1,22 @@
+__pycache__/
+*.pyc
+*.pyo
+*.spec
+build/
+dist/
+.venv/
+venv/
+
+*.log
+*.settings.json
+*.state.json
+starstrings_settings.json
+starstrings_state.json
+starstrings_updater.log
+Backups/
+
+*.exe
+app_icon - Copy.ico
+app_icon - Copy.png
+StarStringsUpdater.ps1
+
