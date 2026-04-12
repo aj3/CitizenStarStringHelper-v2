@@ -1,0 +1,65 @@
+name: Build and Sign Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-and-sign:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install pyinstaller pystray pillow
+
+      - name: Build updater helper
+        run: >
+          python -m PyInstaller --noconfirm --windowed --onefile
+          --icon app_icon.ico
+          --name "Citizen StarString Updater Helper"
+          updater_helper.py
+
+      - name: Build main executable
+        run: >
+          python -m PyInstaller --noconfirm --windowed --onefile
+          --icon app_icon.ico
+          --add-data "app_icon.png;."
+          --add-data "app_icon.ico;."
+          --add-data "dist\Citizen StarString Updater Helper.exe;."
+          --name "Citizen StarString Helper"
+          starstrings_updater.py
+
+      - name: Upload unsigned artifact
+        id: upload-unsigned
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-exe
+          path: dist\Citizen StarString Helper.exe
+
+      - name: Sign with SignPath
+        id: sign
+        uses: signpath/github-action-submit-signing-request@v2
+        with:
+          api-token: '${{ secrets.SIGNPATH_API_TOKEN }}'
+          organization-id: '${{ vars.SIGNPATH_ORG_ID }}'
+          project-slug: 'CitizenStarStringHelper'
+          signing-policy-slug: 'release-signing'
+          artifact-configuration-slug: 'default'
+          github-artifact-id: '${{ steps.upload-unsigned.outputs.artifact-id }}'
+          wait-for-completion: true
+          output-artifact-directory: './signed'
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: signed/Citizen StarString Helper.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
