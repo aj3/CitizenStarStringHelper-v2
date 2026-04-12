@@ -4,6 +4,7 @@ import ctypes
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -36,7 +37,7 @@ LEGACY_TASK_NAMES = (
 DEFAULT_LIVE_PATH = r"C:\Program Files\Roberts Space Industries\StarCitizen\LIVE"
 DEFAULT_REPO = "https://github.com/MrKraken/StarStrings"
 APP_UPDATE_REPO = "aj3/CitizenStarStringHelper-v2"
-APP_VERSION = "2.0.1"
+APP_VERSION = "2.0.2"
 APP_UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000
 LANGUAGE_LINE = "g_language = english."
 REFERRAL_URL = "https://www.robertsspaceindustries.com/enlist?referral=STAR-J66D-SPVW"
@@ -263,6 +264,23 @@ def format_timestamp(value: str, fallback: str) -> str:
         return parsed.strftime("%b %d, %Y %I:%M:%S %p")
     except ValueError:
         return text
+
+
+def format_scheduler_timestamp(value: str, fallback: str) -> str:
+    text = (value or "").strip()
+    if not text:
+        return fallback
+    lowered = text.lower()
+    if lowered in {"n/a", "never", "disabled", "unknown"}:
+        return fallback
+    if text.startswith("11/30/1999") or text.startswith("11/29/1999"):
+        return fallback
+    for fmt in ("%m/%d/%Y %I:%M:%S %p", "%m/%d/%Y %H:%M:%S"):
+        try:
+            return datetime.strptime(text, fmt).strftime("%b %d, %Y %I:%M:%S %p")
+        except ValueError:
+            pass
+    return text
 
 
 _log_line_count: int = 0  # approximate in-memory count; avoids re-reading the file on every write
@@ -1094,6 +1112,153 @@ class StarStringsApp:
         except Exception as exc:
             self.append_log(f"Could not open log folder: {exc}")
 
+    def _open_path(self, path: Path) -> None:
+        try:
+            target = path if path.is_dir() else path.parent
+            if sys.platform == "win32":
+                os.startfile(str(target))  # type: ignore[attr-defined]
+            else:
+                webbrowser.open(target.as_uri())
+        except Exception as exc:
+            self.append_log(f"Could not open path: {exc}")
+
+    def _parse_update_result(self, message: str) -> dict[str, str]:
+        summary = "StarStrings check completed."
+        release_name = self.state.tracked_release_name or "Current release"
+        user_cfg_action = "Verified USER.cfg settings."
+        backup_path = ""
+
+        release_match = re.search(r"'([^']+)'", message)
+        if release_match:
+            release_name = release_match.group(1)
+
+        if "Manual update completed" in message or "Updated to" in message:
+            summary = "StarStrings was updated successfully."
+        elif "No GitHub changes detected" in message:
+            summary = "StarStrings is already up to date."
+        elif "Tracking initialized" in message:
+            summary = "Tracking was initialized successfully."
+
+        if "Merged USER.cfg" in message:
+            user_cfg_action = "Merged your existing USER.cfg settings."
+        elif "Copied USER.cfg" in message:
+            user_cfg_action = "Copied the packaged USER.cfg into LIVE."
+
+        backup_match = re.search(r"Backup:\s*'([^']+)'", message)
+        if backup_match:
+            backup_path = backup_match.group(1)
+
+        return {
+            "summary": summary,
+            "release_name": release_name,
+            "user_cfg_action": user_cfg_action,
+            "backup_path": backup_path,
+        }
+
+    def _show_run_result_dialog(self, message: str, is_error: bool) -> None:
+        if is_error:
+            dialog = tk.Toplevel(self.root)
+            dialog.title(APP_NAME)
+            dialog.configure(bg="#0d1219")
+            dialog.resizable(False, False)
+            dialog.transient(self.root)
+            dialog.minsize(460, 200)
+            tk.Frame(dialog, bg="#7a2a08", height=2).pack(fill="x", side="top")
+
+            content = tk.Frame(dialog, bg="#0d1219")
+            content.pack(fill="both", expand=True, padx=24, pady=20)
+            tk.Label(content, text="StarStrings Update Failed",
+                     fg="#e8edf2", bg="#0d1219", font=("Segoe UI Semibold", 12)).pack(anchor="w")
+            tk.Label(content, text="The update did not finish. You can review the details below and try again.",
+                     fg="#6e8096", bg="#0d1219", font=("Segoe UI", 9), wraplength=400, justify="left").pack(anchor="w", pady=(6, 12))
+            tk.Label(content, text=message,
+                     fg="#e8edf2", bg="#080c10", font=("Segoe UI", 9), wraplength=400, justify="left",
+                     padx=12, pady=10).pack(fill="x")
+            btn_row = tk.Frame(dialog, bg="#0d1219")
+            btn_row.pack(fill="x", padx=24, pady=(0, 20))
+            tk.Button(btn_row, text="Close", command=dialog.destroy,
+                      bg="#162030", fg="#e8edf2", activebackground="#1e2d3d", activeforeground="#e8edf2",
+                      relief="flat", padx=16, pady=8, font=("Segoe UI Semibold", 9),
+                      cursor="hand2", bd=0).pack(side="right")
+            dialog.update_idletasks()
+            x = self.root.winfo_x() + (self.root.winfo_width() - dialog.winfo_width()) // 2
+            y = self.root.winfo_y() + (self.root.winfo_height() - dialog.winfo_height()) // 2
+            dialog.geometry(f"+{x}+{y}")
+            apply_dark_titlebar(dialog)
+            dialog.grab_set()
+            return
+
+        info = self._parse_update_result(message)
+        dialog = tk.Toplevel(self.root)
+        dialog.title(APP_NAME)
+        dialog.configure(bg="#0d1219")
+        dialog.resizable(False, False)
+        dialog.transient(self.root)
+        dialog.minsize(520, 265)
+        tk.Frame(dialog, bg="#c09040", height=2).pack(fill="x", side="top")
+
+        content = tk.Frame(dialog, bg="#0d1219")
+        content.pack(fill="both", expand=True, padx=24, pady=20)
+        tk.Label(content, text=info["summary"],
+                 fg="#e8edf2", bg="#0d1219", font=("Segoe UI Semibold", 12)).pack(anchor="w")
+        tk.Label(content, text="Your StarStrings files were checked and the result is ready below.",
+                 fg="#6e8096", bg="#0d1219", font=("Segoe UI", 9), wraplength=460, justify="left").pack(anchor="w", pady=(6, 14))
+
+        details = tk.Frame(content, bg="#111922")
+        details.pack(fill="x")
+        rows = [
+            ("Release", info["release_name"]),
+            ("LIVE Folder", Path(self.settings.live_path).name or self.settings.live_path),
+            ("USER.cfg", info["user_cfg_action"]),
+        ]
+        for label_text, value_text in rows:
+            row = tk.Frame(details, bg="#111922")
+            row.pack(fill="x", padx=14, pady=8)
+            tk.Label(row, text=f"{label_text}:", fg="#c09040", bg="#111922",
+                     font=("Segoe UI Semibold", 9)).pack(side="left")
+            tk.Label(row, text=f" {value_text}", fg="#e8edf2", bg="#111922",
+                     font=("Segoe UI", 9), wraplength=320, justify="left").pack(side="left", fill="x", expand=True)
+
+        footer = tk.Frame(content, bg="#0d1219")
+        footer.pack(fill="x", pady=(14, 0))
+
+        countdown_var = tk.StringVar(value="This message closes automatically in 30 seconds.")
+        tk.Label(footer, textvariable=countdown_var,
+                 fg="#6e8096", bg="#0d1219", font=("Segoe UI", 8)).pack(anchor="w")
+
+        link_row = tk.Frame(footer, bg="#0d1219")
+        link_row.pack(fill="x", pady=(8, 0))
+        if info["backup_path"]:
+            tk.Label(link_row, text="Backup:", fg="#6e8096", bg="#0d1219", font=("Segoe UI", 9)).pack(side="left")
+            backup_link = tk.Label(link_row, text=" Backup Location", fg="#c09040", bg="#0d1219",
+                                   cursor="hand2", font=("Segoe UI Semibold", 9, "underline"))
+            backup_link.pack(side="left")
+            backup_link.bind("<Button-1>", lambda _event, p=Path(info["backup_path"]): self._open_path(p))
+
+        action_row = tk.Frame(content, bg="#0d1219")
+        action_row.pack(fill="x", pady=(14, 0))
+        tk.Button(action_row, text="Close", command=dialog.destroy,
+                  bg="#162030", fg="#e8edf2", activebackground="#1e2d3d", activeforeground="#e8edf2",
+                  relief="flat", padx=16, pady=8, font=("Segoe UI Semibold", 9),
+                  cursor="hand2", bd=0).pack(side="right")
+
+        def tick(seconds_left: int = 30) -> None:
+            if not dialog.winfo_exists():
+                return
+            if seconds_left <= 0:
+                dialog.destroy()
+                return
+            countdown_var.set(f"This message closes automatically in {seconds_left} second{'s' if seconds_left != 1 else ''}.")
+            dialog.after(1000, lambda: tick(seconds_left - 1))
+
+        dialog.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width() - dialog.winfo_width()) // 2
+        y = self.root.winfo_y() + (self.root.winfo_height() - dialog.winfo_height()) // 2
+        dialog.geometry(f"+{x}+{y}")
+        apply_dark_titlebar(dialog)
+        dialog.grab_set()
+        tick()
+
     def _open_restore_backup_dialog(self) -> None:
         backups = list_backups()
         if not backups:
@@ -1768,9 +1933,9 @@ class StarStringsApp:
                     continue
                 key, value = raw_line.split(":", 1)
                 lines[key.strip()] = value.strip()
-            status   = lines.get("Status",        "Unknown")
-            last_run = lines.get("Last Run Time", "Unknown")
-            next_run = lines.get("Next Run Time", "Unknown")
+            status = lines.get("Status", "Unknown")
+            last_run = format_scheduler_timestamp(lines.get("Last Run Time", ""), "Not run yet")
+            next_run = format_scheduler_timestamp(lines.get("Next Run Time", ""), "Not scheduled yet")
             self.toggle_button.configure(text="StarStrings Auto Update: On", style="ToggleOn.TButton")
             self.auto_state_var.set("Enabled")
             self.schedule_var.set(f"Scheduled: {status} | Last Run: {last_run} | Next Run: {next_run}")
@@ -1798,11 +1963,9 @@ class StarStringsApp:
         self.run_button.configure(state="normal")
         self.state = load_state()
         self._refresh_status_vars()
+        self._refresh_toggle()
         self.append_log(message)
-        if is_error:
-            messagebox.showerror(APP_NAME, message, parent=self.root)
-        else:
-            messagebox.showinfo(APP_NAME, message, parent=self.root)
+        self._show_run_result_dialog(message, is_error=is_error)
 
     def check_for_app_update(self) -> None:
         if self._app_update_checking:
