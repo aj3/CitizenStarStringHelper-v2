@@ -39,7 +39,7 @@ LEGACY_TASK_NAMES = (
 DEFAULT_LIVE_PATH = r"C:\Program Files\Roberts Space Industries\StarCitizen\LIVE"
 DEFAULT_REPO = "https://github.com/MrKraken/StarStrings"
 APP_UPDATE_REPO = "aj3/CitizenStarStringHelper-v2"
-APP_VERSION = "2.0.3"
+APP_VERSION = "2.1.0"
 APP_UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000
 BLUEPRINT_SCAN_INTERVAL_MS = 15 * 60 * 1000
 LANGUAGE_LINE = "g_language = english."
@@ -50,9 +50,9 @@ MAX_DOWNLOAD_BYTES = 500 * 1024 * 1024  # 500 MB hard cap on any download
 BLUEPRINT_LOG_PATTERN = re.compile(r"Received Blueprint:\s*(.*?):")
 BLUEPRINT_TAG_PATTERN = re.compile(r"<[^>]+>")
 BLUEPRINT_WIKI_BASE_URL = "https://starcitizen.tools/"
-BLUEPRINT_WIKI_OPENSEARCH_URL = "https://starcitizen.tools/api.php?action=opensearch&limit=8&namespace=0&format=json&search="
+BLUEPRINT_WIKI_SEARCH_API_URL = "https://starcitizen.tools/api.php?action=query&list=search&srnamespace=0&srlimit=8&format=json&srsearch="
 BLUEPRINT_WIKI_SEARCH_URL = "https://starcitizen.tools/index.php?search="
-BLUEPRINT_WIKI_USER_AGENT = "CitizenStarStringHelper/2.1.0"
+BLUEPRINT_WIKI_USER_AGENT = f"CitizenStarStringHelper/{APP_VERSION}"
 BLUEPRINT_WIKI_TIMEOUT_SECONDS = 5
 _blueprint_wiki_cache: dict[str, str] = {}
 BLUEPRINT_CATEGORY_OPTIONS = ("Auto", "Armor", "Weapon", "Ammo", "Clothing", "Med", "Tool", "Attachment", "Component", "Unknown")
@@ -318,6 +318,14 @@ def blueprint_wiki_search_url(name: str) -> str:
 
 
 def resolve_blueprint_wiki_url(name: str) -> str:
+    """Resolve the best Star Citizen Wiki URL for a blueprint name.
+
+    Uses the MediaWiki full-text search API (action=query&list=search) which searches
+    article content and titles — far more accurate than OpenSearch (title-only) for
+    blueprints whose wiki article title differs from the in-game name (e.g. "Antium Arms
+    Jet" → "Antium Armor Arms Jet"). Candidates are ranked by word coverage (all query
+    words present in the title) weighted above character sequence similarity.
+    """
     normalized_name = normalize_search_text(name)
     if not normalized_name:
         return BLUEPRINT_WIKI_BASE_URL
@@ -325,26 +333,32 @@ def resolve_blueprint_wiki_url(name: str) -> str:
     if cached:
         return cached
 
+    fallback = blueprint_wiki_search_url(name)
     request = urllib.request.Request(
-        f"{BLUEPRINT_WIKI_OPENSEARCH_URL}{urllib.parse.quote(name.strip())}",
+        f"{BLUEPRINT_WIKI_SEARCH_API_URL}{urllib.parse.quote(name.strip())}",
         headers={"User-Agent": BLUEPRINT_WIKI_USER_AGENT},
     )
-    fallback = blueprint_wiki_search_url(name)
 
     try:
         with urllib.request.urlopen(request, timeout=BLUEPRINT_WIKI_TIMEOUT_SECONDS) as response:
             payload = json.loads(response.read().decode("utf-8", errors="ignore"))
-        titles = payload[1] if isinstance(payload, list) and len(payload) > 1 else []
-        urls = payload[3] if isinstance(payload, list) and len(payload) > 3 else []
+        results = payload.get("query", {}).get("search", [])
+        query_words = set(normalized_name.split())
         candidates: list[tuple[float, str]] = []
-        for title, url in zip(titles, urls):
-            normalized_title = normalize_search_text(str(title))
-            if not normalized_title or not str(url).startswith("http"):
+        for result in results:
+            title = str(result.get("title", "")).strip()
+            if not title:
                 continue
-            score = difflib.SequenceMatcher(None, normalized_name, normalized_title).ratio()
-            if normalized_title == normalized_name:
-                score = 1.0
-            candidates.append((score, str(url)))
+            normalized_title = normalize_search_text(title)
+            if not normalized_title:
+                continue
+            title_words = set(normalized_title.split())
+            # Weight word coverage heavily — catches "Antium Armor Arms Jet" for "Antium Arms Jet"
+            word_coverage = len(query_words & title_words) / len(query_words) if query_words else 0
+            seq_ratio = difflib.SequenceMatcher(None, normalized_name, normalized_title).ratio()
+            score = word_coverage * 0.65 + seq_ratio * 0.35
+            url = blueprint_wiki_url(title)
+            candidates.append((score, url))
         if candidates:
             candidates.sort(key=lambda item: item[0], reverse=True)
             best_url = candidates[0][1]
@@ -1260,8 +1274,6 @@ class StarStringsApp:
         self.blueprint_summary_var = StringVar(value="No blueprint scan has been run yet.")
         self.blueprint_detail_title_var = StringVar(value="Select a blueprint")
         self.blueprint_detail_status_var = StringVar(value="")
-        self.blueprint_detail_wiki_var = StringVar(value="")
-        self.blueprint_category_var = StringVar(value="Auto")
         self.app_update_button_var = StringVar(value="Check for Updates")
         self.app_update_available = False
         self.app_update_release: AppReleaseInfo | None = None
@@ -1283,7 +1295,7 @@ class StarStringsApp:
         self.blueprint_sort_column = "blueprint"
         self.blueprint_sort_desc = False
         self.selected_blueprint_record: BlueprintRecord | None = None
-        self._blueprint_category_changing = False
+        self._search_debounce_job: str | None = None
 
         self._build_style()
         self._build_ui()
@@ -1293,7 +1305,7 @@ class StarStringsApp:
         self._report_completed_staged_update()
         self.append_log(f"Running from: {self.current_app_path_var.get()}")
         self._bind_auto_save()
-        self.blueprint_search_var.trace_add("write", lambda *_: self._refresh_blueprint_list())
+        self.blueprint_search_var.trace_add("write", lambda *_: self._schedule_blueprint_search())
         self.settings_loaded = True
         self.root.after(1500, self.check_for_app_update_silent)
         self.root.after(2500, self._refresh_blueprint_freshness)
@@ -1720,7 +1732,7 @@ class StarStringsApp:
         os._exit(0)
 
     def _cancel_scheduled_jobs(self) -> None:
-        for job_name in ("app_update_pulse_job", "app_update_check_job", "settings_save_job"):
+        for job_name in ("app_update_pulse_job", "app_update_check_job", "settings_save_job", "blueprint_auto_scan_job", "_search_debounce_job"):
             job = getattr(self, job_name, None)
             if job is not None:
                 try:
@@ -2133,20 +2145,20 @@ class StarStringsApp:
         bp_results.columnconfigure(0, weight=1)
         bp_results.rowconfigure(1, weight=1)
         ttk.Label(bp_results, text="Blueprint Matches", style="CardTitle.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 10))
-        self.blueprint_tree = ttk.Treeview(bp_results, columns=("type", "status", "contracts"), show="headings", height=12)
-        self.blueprint_tree.heading("type", text="Type", command=lambda: self._sort_blueprints("type"))
+        self.blueprint_tree = ttk.Treeview(bp_results, columns=("wiki", "blueprint", "type", "status", "contracts"), show="headings", height=12)
+        self.blueprint_tree.heading("wiki", text="SC Wiki")
+        self.blueprint_tree.heading("blueprint", text="Blueprint", command=lambda: self._sort_blueprints("blueprint"))
+        self.blueprint_tree.heading("type", text="Type  ▾", command=lambda: self._sort_blueprints("type"))
         self.blueprint_tree.heading("status", text="Status", command=lambda: self._sort_blueprints("status"))
         self.blueprint_tree.heading("contracts", text="Contracts", command=lambda: self._sort_blueprints("contracts"))
-        self.blueprint_tree["displaycolumns"] = ("type", "status", "contracts")
         self.blueprint_tree.grid(row=1, column=0, sticky="nsew")
+        self.blueprint_tree.column("wiki", width=64, anchor="center", stretch=False)
+        self.blueprint_tree.column("blueprint", width=340, anchor="w")
         self.blueprint_tree.column("type", width=120, anchor="w")
-        self.blueprint_tree.column("status", width=110, anchor="w")
-        self.blueprint_tree.column("contracts", width=120, anchor="center")
-        self.blueprint_tree.heading("#0", text="Blueprint", command=lambda: self._sort_blueprints("blueprint"))
-        self.blueprint_tree["show"] = "tree headings"
-        self.blueprint_tree.column("#0", width=400, anchor="w")
+        self.blueprint_tree.column("status", width=100, anchor="w")
+        self.blueprint_tree.column("contracts", width=80, anchor="center")
         self.blueprint_tree.bind("<<TreeviewSelect>>", self._on_blueprint_selected)
-        self.blueprint_tree.bind("<Double-1>", self._open_selected_blueprint_wiki)
+        self.blueprint_tree.bind("<Button-1>", self._on_blueprint_tree_click)
         self.blueprint_tree.bind("<Return>", self._open_selected_blueprint_wiki)
         self.blueprint_tree.tag_configure("learned", background="#153225", foreground="#dff8e8")
         bp_scroll = ttk.Scrollbar(bp_results, orient="vertical", command=self.blueprint_tree.yview)
@@ -2155,36 +2167,13 @@ class StarStringsApp:
 
         bp_detail = ttk.Frame(blueprints, style="SideCard.TFrame", padding=16)
         bp_detail.grid(row=3, column=0, sticky="nsew")
-        bp_detail.columnconfigure(0, weight=0, minsize=110)
-        bp_detail.columnconfigure(1, weight=0, minsize=260)
-        bp_detail.columnconfigure(2, weight=1)
-        ttk.Label(bp_detail, textvariable=self.blueprint_detail_title_var, style="CardTitle.TLabel").grid(row=0, column=0, columnspan=3, sticky="w")
-        ttk.Label(bp_detail, text="Type", style="SmallAccent.TLabel").grid(row=1, column=0, sticky="w", pady=(8, 2))
-        self.blueprint_category_combo = ttk.Combobox(
-            bp_detail,
-            state="readonly",
-            values=BLUEPRINT_CATEGORY_OPTIONS,
-            textvariable=self.blueprint_category_var,
-            width=20,
-            font=("Segoe UI", 9),
-        )
-        self.blueprint_category_combo.grid(row=1, column=1, sticky="w", pady=(8, 2))
-        self.blueprint_category_combo.bind("<<ComboboxSelected>>", self._on_blueprint_category_changed)
-        self.blueprint_wiki_link = tk.Label(
-            bp_detail,
-            textvariable=self.blueprint_detail_wiki_var,
-            fg="#5fb8ff",
-            bg="#0d1219",
-            cursor="hand2",
-            font=("Segoe UI", 9, "underline"),
-        )
-        self.blueprint_wiki_link.grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 2))
-        self.blueprint_wiki_link.bind("<Button-1>", self._open_selected_blueprint_wiki)
-        ttk.Label(bp_detail, text="Possible Contract Sources", style="SmallAccent.TLabel").grid(row=3, column=0, columnspan=3, sticky="w", pady=(6, 6))
+        bp_detail.columnconfigure(0, weight=1)
+        ttk.Label(bp_detail, textvariable=self.blueprint_detail_title_var, style="CardTitle.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(bp_detail, text="Possible Contract Sources", style="SmallAccent.TLabel").grid(row=1, column=0, sticky="w", pady=(8, 6))
         self.blueprint_contracts_text = tk.Text(bp_detail, height=12, wrap="word", bg="#080c10", fg="#e8edf2", insertbackground="#e8edf2", relief="flat", font=("Segoe UI", 9), padx=10, pady=8)
-        self.blueprint_contracts_text.grid(row=4, column=0, columnspan=3, sticky="nsew")
+        self.blueprint_contracts_text.grid(row=2, column=0, sticky="nsew")
         self.blueprint_contracts_text.configure(state="disabled")
-        bp_detail.rowconfigure(4, weight=1)
+        bp_detail.rowconfigure(2, weight=1)
 
         self.setup_view = setup_view
         self.activity_view = activity
@@ -2444,8 +2433,7 @@ class StarStringsApp:
                 "",
                 "end",
                 iid=f"bp-{index}",
-                text=record.name,
-                values=(record.category, record.status, len(record.contracts)),
+                values=("🔗", record.name, record.category, record.status, len(record.contracts)),
                 tags=("learned",) if record.learned else (),
             )
 
@@ -2511,27 +2499,92 @@ class StarStringsApp:
         record = self._get_selected_blueprint_record()
         if record is None:
             return
-        webbrowser.open(resolve_blueprint_wiki_url(record.name))
+        def worker():
+            url = resolve_blueprint_wiki_url(record.name)
+            self.root.after(0, lambda: webbrowser.open(url))
+        threading.Thread(target=worker, daemon=True).start()
 
-    def _on_blueprint_category_changed(self, _event=None) -> None:
-        if self._blueprint_category_changing:
+    def _on_blueprint_tree_click(self, event) -> None:
+        """Handle left-clicks in the blueprint treeview.
+
+        - Column #1 (SC Wiki): open the wiki page for that row in a background thread.
+        - Column #3 (Type): show an inline combobox overlay for changing the type override.
+        Clicks on headings or outside rows are ignored so sorting commands still work.
+        """
+        region = self.blueprint_tree.identify_region(event.x, event.y)
+        if region != "cell":
             return
-        record = self.selected_blueprint_record
-        if record is None:
+        column = self.blueprint_tree.identify_column(event.x)
+        item_id = self.blueprint_tree.identify_row(event.y)
+        if not item_id:
             return
-        choice = (self.blueprint_category_var.get() or "Auto").strip()
-        override = "" if choice == "Auto" else choice
-        if override == record.category_override:
+        try:
+            index = int(item_id.split("-", 1)[1])
+            record = self.filtered_blueprint_records[index]
+        except Exception:
             return
-        record.category_override = override
-        if self.state.blueprint_category_overrides is None:
-            self.state.blueprint_category_overrides = {}
-        if override:
-            self.state.blueprint_category_overrides[record.normalized_name] = override
-        else:
-            self.state.blueprint_category_overrides.pop(record.normalized_name, None)
-        save_state(self.state)
-        self._refresh_blueprint_list()
+        if column == "#1":  # SC Wiki column
+            def worker():
+                url = resolve_blueprint_wiki_url(record.name)
+                self.root.after(0, lambda: webbrowser.open(url))
+            threading.Thread(target=worker, daemon=True).start()
+        elif column == "#3":  # Type column
+            self._show_inline_type_combobox(item_id, column, record)
+
+    def _show_inline_type_combobox(self, item_id: str, column: str, record: BlueprintRecord) -> None:
+        """Place a Combobox widget directly over the Type cell for inline editing."""
+        bbox = self.blueprint_tree.bbox(item_id, column)
+        if not bbox:
+            return
+        x, y, width, height = bbox
+
+        combo = ttk.Combobox(
+            self.blueprint_tree,
+            values=BLUEPRINT_CATEGORY_OPTIONS,
+            state="readonly",
+            font=("Segoe UI", 9),
+        )
+        combo.set(record.category_override or "Auto")
+        combo.place(x=x, y=y, width=width, height=height)
+        combo.focus_set()
+        # Trigger dropdown open after the widget is rendered
+        combo.after(40, lambda: combo.event_generate("<Button-1>"))
+
+        def on_select(_event=None) -> None:
+            choice = combo.get()
+            _dismiss()
+            override = "" if choice == "Auto" else choice
+            if override == record.category_override:
+                return
+            record.category_override = override
+            if self.state.blueprint_category_overrides is None:
+                self.state.blueprint_category_overrides = {}
+            if override:
+                self.state.blueprint_category_overrides[record.normalized_name] = override
+            else:
+                self.state.blueprint_category_overrides.pop(record.normalized_name, None)
+            save_state(self.state)
+            self._refresh_blueprint_list()
+
+        def _dismiss(_event=None) -> None:
+            try:
+                combo.place_forget()
+                combo.destroy()
+            except Exception:
+                pass
+
+        combo.bind("<<ComboboxSelected>>", on_select)
+        combo.bind("<FocusOut>", _dismiss)
+        combo.bind("<Escape>", _dismiss)
+
+    def _schedule_blueprint_search(self) -> None:
+        """Debounce blueprint search box keystrokes (150 ms) to avoid O(n) work per key."""
+        if self._search_debounce_job is not None:
+            try:
+                self.root.after_cancel(self._search_debounce_job)
+            except Exception:
+                pass
+        self._search_debounce_job = self.root.after(150, self._refresh_blueprint_list)
 
     def _show_blueprint_details(self, record: BlueprintRecord | None) -> None:
         self.selected_blueprint_record = record
@@ -2539,22 +2592,11 @@ class StarStringsApp:
         self.blueprint_contracts_text.delete("1.0", "end")
         if record is None:
             self.blueprint_detail_title_var.set("No blueprint selected")
-            self.blueprint_detail_status_var.set("")
-            self.blueprint_detail_wiki_var.set("")
-            self._blueprint_category_changing = True
-            self.blueprint_category_var.set("Auto")
-            self._blueprint_category_changing = False
             self.blueprint_contracts_text.insert("1.0", "Possible contract sources will appear here once a blueprint is selected.")
             self.blueprint_contracts_text.configure(state="disabled")
             return
 
         self.blueprint_detail_title_var.set(record.name)
-        self.blueprint_detail_status_var.set("")
-        self.blueprint_detail_wiki_var.set("Open on Star Citizen Wiki")
-        self._blueprint_category_changing = True
-        self.blueprint_category_var.set(record.category_override or "Auto")
-        self._blueprint_category_changing = False
-
         if record.contracts:
             for contract in record.contracts:
                 self.blueprint_contracts_text.insert("end", f"• {contract}\n")
