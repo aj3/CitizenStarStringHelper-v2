@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import difflib
 import io
 import json
 import os
@@ -13,6 +14,7 @@ import threading
 import time
 import tkinter as tk
 import urllib.error
+import urllib.parse
 import urllib.request
 import webbrowser
 import zipfile
@@ -37,13 +39,23 @@ LEGACY_TASK_NAMES = (
 DEFAULT_LIVE_PATH = r"C:\Program Files\Roberts Space Industries\StarCitizen\LIVE"
 DEFAULT_REPO = "https://github.com/MrKraken/StarStrings"
 APP_UPDATE_REPO = "aj3/CitizenStarStringHelper-v2"
-APP_VERSION = "2.0.2"
+APP_VERSION = "2.0.3"
 APP_UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000
+BLUEPRINT_SCAN_INTERVAL_MS = 15 * 60 * 1000
 LANGUAGE_LINE = "g_language = english."
 REFERRAL_URL = "https://www.robertsspaceindustries.com/enlist?referral=STAR-J66D-SPVW"
 MAX_LOG_LINES = 300
 UPDATER_HELPER_NAME = "Citizen StarString Updater Helper.exe"
 MAX_DOWNLOAD_BYTES = 500 * 1024 * 1024  # 500 MB hard cap on any download
+BLUEPRINT_LOG_PATTERN = re.compile(r"Received Blueprint:\s*(.*?):")
+BLUEPRINT_TAG_PATTERN = re.compile(r"<[^>]+>")
+BLUEPRINT_WIKI_BASE_URL = "https://starcitizen.tools/"
+BLUEPRINT_WIKI_OPENSEARCH_URL = "https://starcitizen.tools/api.php?action=opensearch&limit=8&namespace=0&format=json&search="
+BLUEPRINT_WIKI_SEARCH_URL = "https://starcitizen.tools/index.php?search="
+BLUEPRINT_WIKI_USER_AGENT = "CitizenStarStringHelper/2.1.0"
+BLUEPRINT_WIKI_TIMEOUT_SECONDS = 5
+_blueprint_wiki_cache: dict[str, str] = {}
+BLUEPRINT_CATEGORY_OPTIONS = ("Auto", "Armor", "Weapon", "Ammo", "Clothing", "Med", "Tool", "Attachment", "Component", "Unknown")
 
 
 def runtime_dir() -> Path:
@@ -213,6 +225,10 @@ class State:
     last_run_at: str = ""
     last_checked_at: str = ""
     last_update_at: str = ""
+    blueprints_last_scanned_at: str = ""
+    blueprints_last_scanned_release_id: str = ""
+    blueprints_last_scanned_release_name: str = ""
+    blueprint_category_overrides: dict[str, str] | None = None
 
 
 @dataclass
@@ -235,6 +251,30 @@ class AppReleaseInfo:
     digest: str = ""  # SHA256 hex from GitHub asset digest field, if available
 
 
+@dataclass
+class BlueprintRecord:
+    name: str
+    normalized_name: str
+    inferred_category: str
+    category_override: str
+    contracts: list[str]
+    learned: bool
+    learned_count: int
+    learned_sources: list[str]
+
+    @property
+    def category(self) -> str:
+        return self.category_override or self.inferred_category
+
+    @property
+    def status(self) -> str:
+        if self.learned:
+            return "Learned"
+        if self.contracts:
+            return "Missing"
+        return "Unknown"
+
+
 class UpdaterError(Exception):
     pass
 
@@ -253,6 +293,109 @@ def sha256_file(path: Path) -> str:
 
 def now_text() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def strip_markup(text: str) -> str:
+    cleaned = BLUEPRINT_TAG_PATTERN.sub("", text or "")
+    cleaned = cleaned.replace("\\n", "\n")
+    return " ".join(cleaned.split()).strip()
+
+
+def normalize_search_text(text: str) -> str:
+    cleaned = strip_markup(text).lower()
+    cleaned = re.sub(r"[^a-z0-9]+", " ", cleaned)
+    return " ".join(cleaned.split())
+
+
+def blueprint_wiki_url(name: str) -> str:
+    page_name = name.strip().replace(" ", "_")
+    safe_chars = "()!,-._~'"
+    return f"{BLUEPRINT_WIKI_BASE_URL}{urllib.parse.quote(page_name, safe=safe_chars)}"
+
+
+def blueprint_wiki_search_url(name: str) -> str:
+    return f"{BLUEPRINT_WIKI_SEARCH_URL}{urllib.parse.quote(name.strip())}"
+
+
+def resolve_blueprint_wiki_url(name: str) -> str:
+    normalized_name = normalize_search_text(name)
+    if not normalized_name:
+        return BLUEPRINT_WIKI_BASE_URL
+    cached = _blueprint_wiki_cache.get(normalized_name)
+    if cached:
+        return cached
+
+    request = urllib.request.Request(
+        f"{BLUEPRINT_WIKI_OPENSEARCH_URL}{urllib.parse.quote(name.strip())}",
+        headers={"User-Agent": BLUEPRINT_WIKI_USER_AGENT},
+    )
+    fallback = blueprint_wiki_search_url(name)
+
+    try:
+        with urllib.request.urlopen(request, timeout=BLUEPRINT_WIKI_TIMEOUT_SECONDS) as response:
+            payload = json.loads(response.read().decode("utf-8", errors="ignore"))
+        titles = payload[1] if isinstance(payload, list) and len(payload) > 1 else []
+        urls = payload[3] if isinstance(payload, list) and len(payload) > 3 else []
+        candidates: list[tuple[float, str]] = []
+        for title, url in zip(titles, urls):
+            normalized_title = normalize_search_text(str(title))
+            if not normalized_title or not str(url).startswith("http"):
+                continue
+            score = difflib.SequenceMatcher(None, normalized_name, normalized_title).ratio()
+            if normalized_title == normalized_name:
+                score = 1.0
+            candidates.append((score, str(url)))
+        if candidates:
+            candidates.sort(key=lambda item: item[0], reverse=True)
+            best_url = candidates[0][1]
+            _blueprint_wiki_cache[normalized_name] = best_url
+            return best_url
+    except Exception:
+        pass
+
+    _blueprint_wiki_cache[normalized_name] = fallback
+    return fallback
+
+
+def fuzzy_query_match(query: str, haystack: str) -> bool:
+    if not query:
+        return True
+    if query in haystack:
+        return True
+    query_tokens = query.split()
+    haystack_tokens = haystack.split()
+    for token in query_tokens:
+        if token in haystack:
+            continue
+        if not any(
+            token in candidate
+            or candidate in token
+            or difflib.SequenceMatcher(None, token, candidate).ratio() >= 0.66
+            for candidate in haystack_tokens
+        ):
+            return False
+    return True
+
+
+def infer_blueprint_category(name: str) -> str:
+    normalized = normalize_search_text(name)
+    if not normalized:
+        return "Unknown"
+
+    checks: list[tuple[str, tuple[str, ...]]] = [
+        ("Ammo", ("magazine", "battery", "drum", "rocket", "missile", "ammo", "cap")),
+        ("Weapon", ("rifle", "pistol", "smg", "shotgun", "sniper", "launcher", "cannon", "gun", "laser", "knife")),
+        ("Armor", ("helmet", "arms", "arm", "legs", "leg", "core", "torso", "armor", "vest")),
+        ("Clothing", ("jacket", "shirt", "pants", "boots", "gloves", "hat", "mask", "beanie")),
+        ("Med", ("medgun", "med gun", "medical", "medpen", "pen", "injector")),
+        ("Tool", ("tool", "tractor", "multitool", "multi tool", "salvage", "mining", "cutter")),
+        ("Attachment", ("scope", "sight", "barrel", "muzzle", "compensator", "suppressor", "grip", "rail")),
+        ("Component", ("cooler", "power plant", "shield", "generator", "drive", "radar", "computer", "turret")),
+    ]
+    for category, tokens in checks:
+        if any(token in normalized for token in tokens):
+            return category
+    return "Unknown"
 
 
 def format_timestamp(value: str, fallback: str) -> str:
@@ -388,6 +531,14 @@ def load_state() -> State:
             last_run_at=str(data.get("last_run_at") or ""),
             last_checked_at=str(data.get("last_checked_at") or ""),
             last_update_at=str(data.get("last_update_at") or ""),
+            blueprints_last_scanned_at=str(data.get("blueprints_last_scanned_at") or ""),
+            blueprints_last_scanned_release_id=str(data.get("blueprints_last_scanned_release_id") or ""),
+            blueprints_last_scanned_release_name=str(data.get("blueprints_last_scanned_release_name") or ""),
+            blueprint_category_overrides={
+                str(key): str(value)
+                for key, value in (data.get("blueprint_category_overrides") or {}).items()
+                if isinstance(key, str) and isinstance(value, str)
+            },
         )
     except Exception as exc:
         log(f"Failed to load state, using empty state. {exc}")
@@ -403,6 +554,10 @@ def save_state(state: State) -> None:
                 "last_run_at": state.last_run_at,
                 "last_checked_at": state.last_checked_at,
                 "last_update_at": state.last_update_at,
+                "blueprints_last_scanned_at": state.blueprints_last_scanned_at,
+                "blueprints_last_scanned_release_id": state.blueprints_last_scanned_release_id,
+                "blueprints_last_scanned_release_name": state.blueprints_last_scanned_release_name,
+                "blueprint_category_overrides": state.blueprint_category_overrides or {},
             },
             indent=2,
         ),
@@ -416,6 +571,175 @@ def github_headers() -> dict[str, str]:
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
+
+
+def read_localization_entries(global_ini_path: Path) -> dict[str, str]:
+    entries: dict[str, str] = {}
+    with global_ini_path.open("r", encoding="utf-8", errors="ignore") as handle:
+        for raw_line in handle:
+            line = raw_line.rstrip("\r\n")
+            if not line or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            entries[key.strip()] = value
+    return entries
+
+
+def title_key_candidates(description_key: str) -> list[str]:
+    candidates: list[str] = []
+    if "_desc" in description_key:
+        candidates.append(re.sub(r"_desc(,P)?$", r"_title\1", description_key))
+    if "_Repeat_desc" in description_key:
+        candidates.append(re.sub(r"_Repeat_desc(,P)?$", r"_Repeat_title\1", description_key))
+    if "_Desc_" in description_key:
+        candidates.append(description_key.replace("_Desc_", "_Title_"))
+    if "_desc_" in description_key:
+        candidates.append(description_key.replace("_desc_", "_title_"))
+    if description_key.endswith(",P"):
+        candidates.append(description_key[:-2])
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for candidate in candidates:
+        for variant in (candidate, candidate.replace(",P", ""), f"{candidate},P" if not candidate.endswith(",P") else candidate):
+            if variant and variant not in seen:
+                seen.add(variant)
+                ordered.append(variant)
+    return ordered
+
+
+def extract_blueprint_names_from_description(description: str) -> list[str]:
+    lines = [strip_markup(line).strip() for line in description.split("\\n")]
+    collecting = False
+    blueprints: list[str] = []
+    for line in lines:
+        if not line:
+            continue
+        if "Potential Blueprints" in line:
+            collecting = True
+            continue
+        if not collecting:
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            continue
+        if "Regional Variants" in line:
+            continue
+        if line.startswith("- "):
+            name = line[2:].strip()
+            if name:
+                blueprints.append(name)
+            continue
+        if blueprints:
+            break
+    return blueprints
+
+
+def parse_starstrings_blueprints(live_path: str) -> tuple[dict[str, dict[str, object]], Path]:
+    global_ini_path = Path(live_path) / "Data" / "Localization" / "english" / "global.ini"
+    if not global_ini_path.exists():
+        raise UpdaterError(f"Could not find StarStrings localization data at {global_ini_path}")
+
+    entries = read_localization_entries(global_ini_path)
+    blueprints: dict[str, dict[str, object]] = {}
+    for key, value in entries.items():
+        if "Potential Blueprints" not in value:
+            continue
+        contract_title = ""
+        for candidate in title_key_candidates(key):
+            if candidate in entries:
+                possible_title = strip_markup(entries[candidate]).replace("[BP]*", "").replace("[BP]", "").strip()
+                if possible_title and "Potential Blueprints" not in possible_title and len(possible_title) < 140:
+                    contract_title = possible_title
+                    break
+        if not contract_title:
+            contract_title = strip_markup(key)
+        for blueprint_name in extract_blueprint_names_from_description(value):
+            normalized = normalize_search_text(blueprint_name)
+            if not normalized:
+                continue
+            record = blueprints.setdefault(
+                normalized,
+                {"name": blueprint_name, "contracts": set()},
+            )
+            record["contracts"].add(contract_title)
+    return blueprints, global_ini_path
+
+
+def parse_learned_blueprints(live_path: str) -> tuple[dict[str, dict[str, object]], list[Path]]:
+    live_dir = Path(live_path)
+    log_paths: list[Path] = []
+    game_log = live_dir / "game.log"
+    if game_log.exists():
+        log_paths.append(game_log)
+    backup_dir = live_dir / "logbackups"
+    if backup_dir.exists():
+        log_paths.extend(sorted(backup_dir.glob("*.log")))
+
+    learned: dict[str, dict[str, object]] = {}
+    for log_path in log_paths:
+        try:
+            with log_path.open("r", encoding="utf-8", errors="ignore") as handle:
+                for line in handle:
+                    match = BLUEPRINT_LOG_PATTERN.search(line)
+                    if not match:
+                        continue
+                    blueprint_name = strip_markup(match.group(1))
+                    normalized = normalize_search_text(blueprint_name)
+                    if not normalized:
+                        continue
+                    record = learned.setdefault(
+                        normalized,
+                        {"name": blueprint_name, "count": 0, "sources": set()},
+                    )
+                    record["count"] += 1
+                    record["sources"].add(log_path.name)
+        except Exception:
+            continue
+    return learned, log_paths
+
+
+def collect_blueprint_records(live_path: str) -> tuple[list[BlueprintRecord], dict[str, object]]:
+    starstrings_records, global_ini_path = parse_starstrings_blueprints(live_path)
+    learned_records, log_paths = parse_learned_blueprints(live_path)
+    state = load_state()
+    overrides = state.blueprint_category_overrides or {}
+
+    all_keys = sorted(set(starstrings_records) | set(learned_records))
+    results: list[BlueprintRecord] = []
+    for key in all_keys:
+        starstrings_record = starstrings_records.get(key) or {}
+        learned_record = learned_records.get(key) or {}
+        contracts = sorted(starstrings_record.get("contracts", set()))
+        learned_sources = sorted(learned_record.get("sources", set()))
+        display_name = (
+            str(learned_record.get("name") or "")
+            or str(starstrings_record.get("name") or "")
+            or key
+        )
+        results.append(
+            BlueprintRecord(
+                name=display_name,
+                normalized_name=key,
+                inferred_category=infer_blueprint_category(display_name),
+                category_override=overrides.get(key, ""),
+                contracts=contracts,
+                learned=bool(learned_record),
+                learned_count=int(learned_record.get("count") or 0),
+                learned_sources=learned_sources,
+            )
+        )
+
+    metadata = {
+        "global_ini_path": global_ini_path,
+        "log_paths": log_paths,
+        "learned_count": sum(1 for record in results if record.learned),
+        "available_count": sum(1 for record in results if record.contracts),
+        "missing_count": sum(1 for record in results if record.contracts and not record.learned),
+        "total_count": len(results),
+        "scanned_at": datetime.now().isoformat(),
+        "tracked_release_id": state.tracked_release_id,
+        "tracked_release_name": state.tracked_release_name,
+    }
+    return results, metadata
 
 
 def fetch_latest_release(repo_value: str) -> ReleaseInfo:
@@ -781,15 +1105,12 @@ def run_update(settings: Settings, allow_prompt: bool, parent: Tk | None = None,
         log(f"GitHub change detected for '{settings.github_repo}': '{previous_name}' -> '{release.name}'.")
 
     user_cfg_result, backup_path = install_release(release, live_path)
-    save_state(
-        State(
-            tracked_release_id=release.release_id,
-            tracked_release_name=release.name,
-            last_run_at=now_iso,
-            last_checked_at=now_iso,
-            last_update_at=now_iso,
-        )
-    )
+    state.tracked_release_id = release.release_id
+    state.tracked_release_name = release.name
+    state.last_run_at = now_iso
+    state.last_checked_at = now_iso
+    state.last_update_at = now_iso
+    save_state(state)
     log(f"USER.cfg action: {user_cfg_result}.")
     if force_update:
         message = f"Manual update completed with '{release.name}' in '{live_path}'. {user_cfg_result}. Backup: '{backup_path}'."
@@ -908,8 +1229,8 @@ class StarStringsApp:
 
         self.root = Tk()
         self.root.title(APP_NAME)
-        self.root.geometry("760x860")
-        self.root.minsize(720, 820)
+        self.root.geometry("900x940")
+        self.root.minsize(840, 880)
         self.root.configure(bg="#080c10")
         self.root.after(50, lambda: ensure_taskbar_window(self.root))
         self.root.after(100, lambda: apply_dark_titlebar(self.root))
@@ -931,12 +1252,23 @@ class StarStringsApp:
         self.last_checked_var = StringVar(value=format_timestamp(self.state.last_checked_at, "Not checked yet"))
         self.last_updated_var = StringVar(value=format_timestamp(self.state.last_update_at, "No update applied yet"))
         self.auto_state_var = StringVar(value="")
+        self.blueprint_search_var = StringVar(value="")
+        self.blueprint_filter_var = StringVar(value="All")
+        self.blueprint_type_filter_var = StringVar(value="All Types")
+        self.blueprint_search_mode_var = StringVar(value="Strict")
+        self.blueprint_status_var = StringVar(value="Scan your StarStrings data to see available and learned blueprints.")
+        self.blueprint_summary_var = StringVar(value="No blueprint scan has been run yet.")
+        self.blueprint_detail_title_var = StringVar(value="Select a blueprint")
+        self.blueprint_detail_status_var = StringVar(value="")
+        self.blueprint_detail_wiki_var = StringVar(value="")
+        self.blueprint_category_var = StringVar(value="Auto")
         self.app_update_button_var = StringVar(value="Check for Updates")
         self.app_update_available = False
         self.app_update_release: AppReleaseInfo | None = None
         self.app_update_pulse_on = False
         self.app_update_pulse_job: str | None = None
         self.app_update_check_job: str | None = None
+        self.blueprint_auto_scan_job: str | None = None
         self.settings_save_job: str | None = None
         self._app_update_checking = False  # guard against concurrent update checks
         self.settings_loaded = False
@@ -944,6 +1276,14 @@ class StarStringsApp:
         self.inline_info_labels: list[ttk.Label] = []
         self.meta_labels: list[ttk.Label] = []
         self.header_art_photo = None
+        self.blueprint_records: list[BlueprintRecord] = []
+        self.filtered_blueprint_records: list[BlueprintRecord] = []
+        self.blueprint_scan_metadata: dict[str, object] = {}
+        self.blueprint_scan_in_progress = False
+        self.blueprint_sort_column = "blueprint"
+        self.blueprint_sort_desc = False
+        self.selected_blueprint_record: BlueprintRecord | None = None
+        self._blueprint_category_changing = False
 
         self._build_style()
         self._build_ui()
@@ -953,8 +1293,11 @@ class StarStringsApp:
         self._report_completed_staged_update()
         self.append_log(f"Running from: {self.current_app_path_var.get()}")
         self._bind_auto_save()
+        self.blueprint_search_var.trace_add("write", lambda *_: self._refresh_blueprint_list())
         self.settings_loaded = True
         self.root.after(1500, self.check_for_app_update_silent)
+        self.root.after(2500, self._refresh_blueprint_freshness)
+        self.root.after(4000, self._schedule_blueprint_auto_scan)
 
     def _build_style(self) -> None:
         # ── RSI-inspired palette ─────────────────────────────────────────────
@@ -1547,10 +1890,13 @@ class StarStringsApp:
         view_row.grid(row=1, column=0, sticky="w", pady=(12, 0))
         view_row.columnconfigure(0, weight=0)
         view_row.columnconfigure(1, weight=0)
+        view_row.columnconfigure(2, weight=0)
         self.setup_view_button = ttk.Button(view_row, text="SETUP", style="ViewActive.TButton", command=lambda: self._show_view("setup"))
         self.setup_view_button.grid(row=0, column=0, padx=(0, 8))
         self.activity_view_button = ttk.Button(view_row, text="ACTIVITY", style="ViewIdle.TButton", command=lambda: self._show_view("activity"))
-        self.activity_view_button.grid(row=0, column=1)
+        self.activity_view_button.grid(row=0, column=1, padx=(0, 8))
+        self.blueprints_view_button = ttk.Button(view_row, text="BLUEPRINTS", style="ViewIdle.TButton", command=lambda: self._show_view("blueprints"))
+        self.blueprints_view_button.grid(row=0, column=2)
 
         # Gold accent line between header and content (RSI nav-bar style)
         tk.Frame(root_frame, bg="#c09040", height=1).grid(row=1, column=0, sticky="ew", pady=(0, 14))
@@ -1720,8 +2066,129 @@ class StarStringsApp:
         self.log_widget.tag_configure("muted",   foreground="#6e8096")  # grey
         self.log_widget.configure(state="disabled")
 
+        blueprints = ttk.Frame(self.content_host, style="Root.TFrame")
+        blueprints.grid(row=0, column=0, sticky="nsew")
+        blueprints.columnconfigure(0, weight=1)
+        blueprints.rowconfigure(2, weight=1)
+        blueprints.rowconfigure(3, weight=1)
+
+        bp_toolbar = ttk.Frame(blueprints, style="Card.TFrame", padding=16)
+        bp_toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 12))
+        bp_toolbar.columnconfigure(1, weight=1)
+        bp_toolbar.columnconfigure(3, weight=0)
+        bp_toolbar.columnconfigure(5, weight=0)
+        bp_toolbar.columnconfigure(7, weight=0)
+        bp_toolbar.columnconfigure(9, weight=0)
+
+        ttk.Label(bp_toolbar, text="Blueprints", style="SectionTitle.TLabel").grid(row=0, column=0, columnspan=10, sticky="w")
+        ttk.Label(bp_toolbar, text="Search learned and mission-linked blueprints from your installed StarStrings data.", style="Muted.TLabel").grid(row=1, column=0, columnspan=10, sticky="w", pady=(4, 12))
+        ttk.Label(bp_toolbar, text="SEARCH", style="SmallAccent.TLabel").grid(row=2, column=0, sticky="w", padx=(0, 10))
+        search_entry = ttk.Entry(bp_toolbar, textvariable=self.blueprint_search_var, font=("Segoe UI", 10))
+        search_entry.grid(row=2, column=1, sticky="ew", padx=(0, 12))
+        ttk.Label(bp_toolbar, text="FILTER", style="SmallAccent.TLabel").grid(row=2, column=2, sticky="w", padx=(0, 10))
+        self.blueprint_filter_combo = ttk.Combobox(
+            bp_toolbar,
+            state="readonly",
+            values=("All", "Learned", "Missing"),
+            textvariable=self.blueprint_filter_var,
+            width=18,
+            font=("Segoe UI", 9),
+        )
+        self.blueprint_filter_combo.grid(row=2, column=3, sticky="ew", padx=(0, 12))
+        self.blueprint_filter_combo.bind("<<ComboboxSelected>>", lambda _event: self._refresh_blueprint_list())
+        ttk.Label(bp_toolbar, text="TYPE", style="SmallAccent.TLabel").grid(row=2, column=4, sticky="w", padx=(0, 10))
+        self.blueprint_type_filter_combo = ttk.Combobox(
+            bp_toolbar,
+            state="readonly",
+            values=("All Types", "Armor", "Weapon", "Ammo", "Clothing", "Med", "Tool", "Attachment", "Component", "Unknown"),
+            textvariable=self.blueprint_type_filter_var,
+            width=14,
+            font=("Segoe UI", 9),
+        )
+        self.blueprint_type_filter_combo.grid(row=2, column=5, sticky="ew", padx=(0, 12))
+        self.blueprint_type_filter_combo.bind("<<ComboboxSelected>>", lambda _event: self._refresh_blueprint_list())
+        ttk.Label(bp_toolbar, text="MODE", style="SmallAccent.TLabel").grid(row=2, column=6, sticky="w", padx=(0, 10))
+        self.blueprint_search_mode_combo = ttk.Combobox(
+            bp_toolbar,
+            state="readonly",
+            values=("Strict", "Fuzzy"),
+            textvariable=self.blueprint_search_mode_var,
+            width=10,
+            font=("Segoe UI", 9),
+        )
+        self.blueprint_search_mode_combo.grid(row=2, column=7, sticky="ew", padx=(0, 12))
+        self.blueprint_search_mode_combo.bind("<<ComboboxSelected>>", lambda _event: self._refresh_blueprint_list())
+        self.blueprint_scan_button = ttk.Button(bp_toolbar, text="Scan Blueprints", style="Primary.TButton", command=self.scan_blueprints)
+        self.blueprint_scan_button.grid(row=2, column=9, sticky="ew")
+
+        ttk.Label(bp_toolbar, textvariable=self.blueprint_status_var, style="Muted.TLabel").grid(row=3, column=0, columnspan=10, sticky="w", pady=(12, 0))
+
+        bp_summary = ttk.Frame(blueprints, style="Card.TFrame", padding=12)
+        bp_summary.grid(row=1, column=0, sticky="ew", pady=(0, 12))
+        bp_summary.columnconfigure(0, weight=1)
+        ttk.Label(bp_summary, textvariable=self.blueprint_summary_var, style="MutedSide.TLabel").grid(row=0, column=0, sticky="w")
+
+        bp_results = ttk.Frame(blueprints, style="Card.TFrame", padding=14)
+        bp_results.grid(row=2, column=0, sticky="nsew", pady=(0, 12))
+        bp_results.columnconfigure(0, weight=1)
+        bp_results.rowconfigure(1, weight=1)
+        ttk.Label(bp_results, text="Blueprint Matches", style="CardTitle.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 10))
+        self.blueprint_tree = ttk.Treeview(bp_results, columns=("type", "status", "contracts"), show="headings", height=12)
+        self.blueprint_tree.heading("type", text="Type", command=lambda: self._sort_blueprints("type"))
+        self.blueprint_tree.heading("status", text="Status", command=lambda: self._sort_blueprints("status"))
+        self.blueprint_tree.heading("contracts", text="Contracts", command=lambda: self._sort_blueprints("contracts"))
+        self.blueprint_tree["displaycolumns"] = ("type", "status", "contracts")
+        self.blueprint_tree.grid(row=1, column=0, sticky="nsew")
+        self.blueprint_tree.column("type", width=120, anchor="w")
+        self.blueprint_tree.column("status", width=110, anchor="w")
+        self.blueprint_tree.column("contracts", width=120, anchor="center")
+        self.blueprint_tree.heading("#0", text="Blueprint", command=lambda: self._sort_blueprints("blueprint"))
+        self.blueprint_tree["show"] = "tree headings"
+        self.blueprint_tree.column("#0", width=400, anchor="w")
+        self.blueprint_tree.bind("<<TreeviewSelect>>", self._on_blueprint_selected)
+        self.blueprint_tree.bind("<Double-1>", self._open_selected_blueprint_wiki)
+        self.blueprint_tree.bind("<Return>", self._open_selected_blueprint_wiki)
+        self.blueprint_tree.tag_configure("learned", background="#153225", foreground="#dff8e8")
+        bp_scroll = ttk.Scrollbar(bp_results, orient="vertical", command=self.blueprint_tree.yview)
+        self.blueprint_tree.configure(yscrollcommand=bp_scroll.set)
+        bp_scroll.grid(row=1, column=1, sticky="ns")
+
+        bp_detail = ttk.Frame(blueprints, style="SideCard.TFrame", padding=16)
+        bp_detail.grid(row=3, column=0, sticky="nsew")
+        bp_detail.columnconfigure(0, weight=0, minsize=110)
+        bp_detail.columnconfigure(1, weight=0, minsize=260)
+        bp_detail.columnconfigure(2, weight=1)
+        ttk.Label(bp_detail, textvariable=self.blueprint_detail_title_var, style="CardTitle.TLabel").grid(row=0, column=0, columnspan=3, sticky="w")
+        ttk.Label(bp_detail, text="Type", style="SmallAccent.TLabel").grid(row=1, column=0, sticky="w", pady=(8, 2))
+        self.blueprint_category_combo = ttk.Combobox(
+            bp_detail,
+            state="readonly",
+            values=BLUEPRINT_CATEGORY_OPTIONS,
+            textvariable=self.blueprint_category_var,
+            width=20,
+            font=("Segoe UI", 9),
+        )
+        self.blueprint_category_combo.grid(row=1, column=1, sticky="w", pady=(8, 2))
+        self.blueprint_category_combo.bind("<<ComboboxSelected>>", self._on_blueprint_category_changed)
+        self.blueprint_wiki_link = tk.Label(
+            bp_detail,
+            textvariable=self.blueprint_detail_wiki_var,
+            fg="#5fb8ff",
+            bg="#0d1219",
+            cursor="hand2",
+            font=("Segoe UI", 9, "underline"),
+        )
+        self.blueprint_wiki_link.grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 2))
+        self.blueprint_wiki_link.bind("<Button-1>", self._open_selected_blueprint_wiki)
+        ttk.Label(bp_detail, text="Possible Contract Sources", style="SmallAccent.TLabel").grid(row=3, column=0, columnspan=3, sticky="w", pady=(6, 6))
+        self.blueprint_contracts_text = tk.Text(bp_detail, height=12, wrap="word", bg="#080c10", fg="#e8edf2", insertbackground="#e8edf2", relief="flat", font=("Segoe UI", 9), padx=10, pady=8)
+        self.blueprint_contracts_text.grid(row=4, column=0, columnspan=3, sticky="nsew")
+        self.blueprint_contracts_text.configure(state="disabled")
+        bp_detail.rowconfigure(4, weight=1)
+
         self.setup_view = setup_view
         self.activity_view = activity
+        self.blueprints_view = blueprints
         self._show_view("setup")
         self.root.bind("<Configure>", self._refresh_compact_wraps, add="+")
 
@@ -1754,14 +2221,27 @@ class StarStringsApp:
         self.current_view = view_name
         if view_name == "setup":
             self.activity_view.grid_remove()
+            self.blueprints_view.grid_remove()
             self.setup_view.grid()
             self.setup_view_button.configure(style="ViewActive.TButton")
             self.activity_view_button.configure(style="ViewIdle.TButton")
-        else:
+            self.blueprints_view_button.configure(style="ViewIdle.TButton")
+        elif view_name == "activity":
             self.setup_view.grid_remove()
+            self.blueprints_view.grid_remove()
             self.activity_view.grid()
             self.setup_view_button.configure(style="ViewIdle.TButton")
             self.activity_view_button.configure(style="ViewActive.TButton")
+            self.blueprints_view_button.configure(style="ViewIdle.TButton")
+        else:
+            self.setup_view.grid_remove()
+            self.activity_view.grid_remove()
+            self.blueprints_view.grid()
+            self.setup_view_button.configure(style="ViewIdle.TButton")
+            self.activity_view_button.configure(style="ViewIdle.TButton")
+            self.blueprints_view_button.configure(style="ViewActive.TButton")
+            if not self.blueprint_records and not self.blueprint_scan_in_progress:
+                self.scan_blueprints()
 
     def choose_folder(self) -> None:
         chosen = filedialog.askdirectory(title="Select your Star Citizen LIVE folder", mustexist=True)
@@ -1847,6 +2327,241 @@ class StarStringsApp:
         self.log_widget.delete("1.0", "end")
         self.log_widget.configure(state="disabled")
 
+    def _schedule_blueprint_auto_scan(self) -> None:
+        if self.blueprint_auto_scan_job is not None:
+            try:
+                self.root.after_cancel(self.blueprint_auto_scan_job)
+            except Exception:
+                pass
+        self.blueprint_auto_scan_job = self.root.after(BLUEPRINT_SCAN_INTERVAL_MS, self._run_blueprint_auto_scan)
+
+    def _run_blueprint_auto_scan(self) -> None:
+        self.blueprint_auto_scan_job = None
+        if not self.blueprint_scan_in_progress:
+            self.scan_blueprints(silent=True)
+        self._schedule_blueprint_auto_scan()
+
+    def _refresh_blueprint_freshness(self) -> None:
+        self.state = load_state()
+        scanned_at = format_timestamp(self.state.blueprints_last_scanned_at, "Not scanned yet")
+        scanned_release = self.state.blueprints_last_scanned_release_name or "unknown StarStrings release"
+        tracked_release = self.state.tracked_release_name or "No release tracked yet"
+        if not self.state.blueprints_last_scanned_at:
+            self.blueprint_status_var.set("Blueprints have not been scanned yet. Run a scan to map learned rewards and possible contract sources.")
+            self.blueprint_summary_var.set(f"No blueprint scan has been run yet. Current tracked StarStrings release: {tracked_release}")
+            return
+        if self.state.tracked_release_id and self.state.blueprints_last_scanned_release_id != self.state.tracked_release_id:
+            self.blueprint_status_var.set("Blueprint data is older than the currently tracked StarStrings release. A rescan will refresh contract sources.")
+        else:
+            self.blueprint_status_var.set("Blueprint data reflects the currently installed StarStrings files and your learned blueprint logs.")
+        self.blueprint_summary_var.set(
+            f"Last blueprint scan: {scanned_at}   |   Scanned release: {scanned_release}   |   Current tracked release: {tracked_release}"
+        )
+
+    def scan_blueprints(self, silent: bool = False) -> None:
+        if self.blueprint_scan_in_progress:
+            return
+        self.blueprint_scan_in_progress = True
+        self.blueprint_scan_button.configure(state="disabled")
+        if not silent:
+            self.blueprint_status_var.set("Scanning StarStrings data and local logs for blueprint information...")
+
+        def worker() -> None:
+            try:
+                records, metadata = collect_blueprint_records(self.live_path_var.get().strip())
+                self.root.after(0, lambda records=records, metadata=metadata, silent=silent: self._complete_blueprint_scan(records, metadata, silent))
+            except Exception as exc:
+                self.root.after(0, lambda exc=exc, silent=silent: self._fail_blueprint_scan(exc, silent))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _complete_blueprint_scan(self, records: list[BlueprintRecord], metadata: dict[str, object], silent: bool) -> None:
+        self.blueprint_scan_in_progress = False
+        self.blueprint_scan_button.configure(state="normal")
+        self.blueprint_records = records
+        self.blueprint_scan_metadata = metadata
+        self.state = load_state()
+        self.state.blueprints_last_scanned_at = str(metadata.get("scanned_at") or datetime.now().isoformat())
+        self.state.blueprints_last_scanned_release_id = str(metadata.get("tracked_release_id") or "")
+        self.state.blueprints_last_scanned_release_name = str(metadata.get("tracked_release_name") or "")
+        save_state(self.state)
+        total = int(metadata.get("total_count") or 0)
+        learned = int(metadata.get("learned_count") or 0)
+        missing = int(metadata.get("missing_count") or 0)
+        available = int(metadata.get("available_count") or 0)
+        scanned_at = format_timestamp(str(metadata.get("scanned_at") or ""), "just now")
+        release_name = str(metadata.get("tracked_release_name") or "unknown release")
+        self.blueprint_status_var.set(f"Blueprint scan complete. Parsed {total} blueprints from StarStrings data and local logs.")
+        self.blueprint_summary_var.set(
+            f"Learned: {learned}   |   Contract-linked: {available}   |   Missing: {missing}   |   Last scan: {scanned_at}   |   Release: {release_name}"
+        )
+        if silent:
+            self.append_log(f"Background blueprint refresh complete. Learned {learned}, contract-linked {available}, missing {missing}.")
+        else:
+            self.append_log(f"Blueprint scan complete. Learned {learned}, contract-linked {available}, missing {missing}.")
+        self._refresh_blueprint_list()
+        self._refresh_blueprint_freshness()
+
+    def _fail_blueprint_scan(self, exc: Exception, silent: bool) -> None:
+        self.blueprint_scan_in_progress = False
+        self.blueprint_scan_button.configure(state="normal")
+        self.blueprint_status_var.set("Blueprint scan could not be completed.")
+        self.append_log(f"Blueprint scan failed. {exc}")
+        if not silent:
+            messagebox.showerror(APP_NAME, str(exc), parent=self.root)
+
+    def _refresh_blueprint_list(self) -> None:
+        if not hasattr(self, "blueprint_tree"):
+            return
+        query = normalize_search_text(self.blueprint_search_var.get())
+        filter_value = self.blueprint_filter_var.get().strip() or "All"
+        type_filter = self.blueprint_type_filter_var.get().strip() or "All Types"
+        search_mode = (self.blueprint_search_mode_var.get().strip() or "Strict").lower()
+
+        self.blueprint_tree.delete(*self.blueprint_tree.get_children())
+        self.filtered_blueprint_records = []
+        for record in self.blueprint_records:
+            if filter_value == "Learned" and not record.learned:
+                continue
+            if filter_value == "Missing" and (record.learned or not record.contracts):
+                continue
+            if type_filter != "All Types" and record.category != type_filter:
+                continue
+            if query:
+                haystack = normalize_search_text(" ".join([record.name, record.category, *record.contracts]))
+                if search_mode == "strict":
+                    if query not in haystack:
+                        continue
+                else:
+                    if not fuzzy_query_match(query, haystack):
+                        continue
+            self.filtered_blueprint_records.append(record)
+
+        self._sort_filtered_blueprint_records()
+
+        for index, record in enumerate(self.filtered_blueprint_records):
+            self.blueprint_tree.insert(
+                "",
+                "end",
+                iid=f"bp-{index}",
+                text=record.name,
+                values=(record.category, record.status, len(record.contracts)),
+                tags=("learned",) if record.learned else (),
+            )
+
+        if self.filtered_blueprint_records:
+            first_id = self.blueprint_tree.get_children()[0]
+            self.blueprint_tree.selection_set(first_id)
+            self.blueprint_tree.focus(first_id)
+            self._show_blueprint_details(self.filtered_blueprint_records[0])
+        else:
+            self._show_blueprint_details(None)
+
+    def _sort_filtered_blueprint_records(self) -> None:
+        sort_key = self.blueprint_sort_column
+
+        def key_func(record: BlueprintRecord):
+            if sort_key == "blueprint":
+                return record.name.lower()
+            if sort_key == "type":
+                return (record.category == "Unknown", record.category.lower(), record.name.lower())
+            if sort_key == "status":
+                status_order = {"Learned": 0, "Missing": 1, "Unknown": 2}
+                return (status_order.get(record.status, 9), record.name.lower())
+            if sort_key == "contracts":
+                return (len(record.contracts), record.name.lower())
+            return record.name.lower()
+
+        self.filtered_blueprint_records.sort(key=key_func, reverse=self.blueprint_sort_desc)
+
+    def _sort_blueprints(self, column: str) -> None:
+        if self.blueprint_sort_column == column:
+            self.blueprint_sort_desc = not self.blueprint_sort_desc
+        else:
+            self.blueprint_sort_column = column
+            self.blueprint_sort_desc = False
+        self._refresh_blueprint_list()
+
+    def _on_blueprint_selected(self, _event=None) -> None:
+        selection = self.blueprint_tree.selection()
+        if not selection:
+            self._show_blueprint_details(None)
+            return
+        item_id = selection[0]
+        try:
+            index = int(item_id.split("-", 1)[1])
+            record = self.filtered_blueprint_records[index]
+        except Exception:
+            self._show_blueprint_details(None)
+            return
+        self._show_blueprint_details(record)
+
+    def _get_selected_blueprint_record(self) -> BlueprintRecord | None:
+        selection = self.blueprint_tree.selection()
+        if not selection:
+            return None
+        item_id = selection[0]
+        try:
+            index = int(item_id.split("-", 1)[1])
+            return self.filtered_blueprint_records[index]
+        except Exception:
+            return None
+
+    def _open_selected_blueprint_wiki(self, _event=None) -> None:
+        record = self._get_selected_blueprint_record()
+        if record is None:
+            return
+        webbrowser.open(resolve_blueprint_wiki_url(record.name))
+
+    def _on_blueprint_category_changed(self, _event=None) -> None:
+        if self._blueprint_category_changing:
+            return
+        record = self.selected_blueprint_record
+        if record is None:
+            return
+        choice = (self.blueprint_category_var.get() or "Auto").strip()
+        override = "" if choice == "Auto" else choice
+        if override == record.category_override:
+            return
+        record.category_override = override
+        if self.state.blueprint_category_overrides is None:
+            self.state.blueprint_category_overrides = {}
+        if override:
+            self.state.blueprint_category_overrides[record.normalized_name] = override
+        else:
+            self.state.blueprint_category_overrides.pop(record.normalized_name, None)
+        save_state(self.state)
+        self._refresh_blueprint_list()
+
+    def _show_blueprint_details(self, record: BlueprintRecord | None) -> None:
+        self.selected_blueprint_record = record
+        self.blueprint_contracts_text.configure(state="normal")
+        self.blueprint_contracts_text.delete("1.0", "end")
+        if record is None:
+            self.blueprint_detail_title_var.set("No blueprint selected")
+            self.blueprint_detail_status_var.set("")
+            self.blueprint_detail_wiki_var.set("")
+            self._blueprint_category_changing = True
+            self.blueprint_category_var.set("Auto")
+            self._blueprint_category_changing = False
+            self.blueprint_contracts_text.insert("1.0", "Possible contract sources will appear here once a blueprint is selected.")
+            self.blueprint_contracts_text.configure(state="disabled")
+            return
+
+        self.blueprint_detail_title_var.set(record.name)
+        self.blueprint_detail_status_var.set("")
+        self.blueprint_detail_wiki_var.set("Open on Star Citizen Wiki")
+        self._blueprint_category_changing = True
+        self.blueprint_category_var.set(record.category_override or "Auto")
+        self._blueprint_category_changing = False
+
+        if record.contracts:
+            for contract in record.contracts:
+                self.blueprint_contracts_text.insert("end", f"• {contract}\n")
+        else:
+            self.blueprint_contracts_text.insert("1.0", "No contract source was found in the installed StarStrings data for this blueprint.")
+        self.blueprint_contracts_text.configure(state="disabled")
+
     def _on_app_update_button_click(self) -> None:
         if self.app_update_available and self.app_update_release is not None:
             self._download_and_install_app_update(self.app_update_release)
@@ -1881,6 +2596,7 @@ class StarStringsApp:
         self.last_checked_var.set(format_timestamp(self.state.last_checked_at, "Not checked yet"))
         self.last_updated_var.set(format_timestamp(self.state.last_update_at, "No update applied yet"))
         self.backup_var.set(f"Backups stored in:\n{BACKUP_ROOT}")
+        self._refresh_blueprint_freshness()
 
     def _report_completed_staged_update(self) -> None:
         result_path = PENDING_UPDATE_DIR / "last_update.json"
@@ -1965,6 +2681,8 @@ class StarStringsApp:
         self._refresh_status_vars()
         self._refresh_toggle()
         self.append_log(message)
+        if not is_error:
+            self.scan_blueprints(silent=True)
         self._show_run_result_dialog(message, is_error=is_error)
 
     def check_for_app_update(self) -> None:
