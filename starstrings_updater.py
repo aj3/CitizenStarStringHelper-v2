@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import ctypes
 import difflib
 import io
@@ -39,7 +40,7 @@ LEGACY_TASK_NAMES = (
 DEFAULT_LIVE_PATH = r"C:\Program Files\Roberts Space Industries\StarCitizen\LIVE"
 DEFAULT_REPO = "https://github.com/MrKraken/StarStrings"
 APP_UPDATE_REPO = "aj3/CitizenStarStringHelper-v2"
-APP_VERSION = "2.1.1"
+APP_VERSION = "2.2.0"
 APP_UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000
 BLUEPRINT_SCAN_INTERVAL_MS = 15 * 60 * 1000
 LANGUAGE_LINE = "g_language = english."
@@ -56,6 +57,15 @@ BLUEPRINT_WIKI_USER_AGENT = f"CitizenStarStringHelper/{APP_VERSION}"
 BLUEPRINT_WIKI_TIMEOUT_SECONDS = 5
 _blueprint_wiki_cache: dict[str, str] = {}
 BLUEPRINT_CATEGORY_OPTIONS = ("Auto", "Armor", "Weapon", "Ammo", "Clothing", "Med", "Tool", "Attachment", "Component", "Unknown")
+CRAFTING_DB_URL = (
+    "https://docs.google.com/spreadsheets/d/e/"
+    "2PACX-1vQQFvtTlpzUucwLkfWSvJ_qdDaqAIsfXP7Y6uH2OIlFi_zWrPHgq_R021aw3Ym6wND4APMIIQJOkp23"
+    "/pub?gid=1537513559&single=true&output=csv"
+)
+CRAFTING_DB_TIMEOUT_SECONDS = 15
+CRAFTING_DB_CACHE_MAX_AGE_HOURS = 24
+_crafting_db: dict[str, list["CraftingMaterialEntry"]] | None = None
+_crafting_lookup_cache: dict[str, list["CraftingMaterialEntry"] | None] = {}
 
 
 def runtime_dir() -> Path:
@@ -275,6 +285,13 @@ class BlueprintRecord:
         return "Unknown"
 
 
+@dataclass
+class CraftingMaterialEntry:
+    slot: str
+    resource: str
+    quantity: float
+
+
 class UpdaterError(Exception):
     pass
 
@@ -369,6 +386,129 @@ def resolve_blueprint_wiki_url(name: str) -> str:
 
     _blueprint_wiki_cache[normalized_name] = fallback
     return fallback
+
+
+def format_scu(value: float) -> str:
+    """Format an SCU quantity from the crafting DB, removing float imprecision.
+
+    In SC crafting, 1 µSCU = 0.01 SCU — all quantities in the community DB are
+    exact multiples of 0.01 SCU stored as imprecise floats (0.02999999933 → 3 µSCU).
+    Values ≥ 1 SCU are shown as SCU; smaller values as whole µSCU numbers.
+    """
+    clean = round(value, 4)
+    if clean <= 0:
+        return "0 µSCU"
+    if clean < 1.0:
+        muscu = round(clean * 100)
+        return f"{muscu} µSCU" if muscu > 0 else f"{clean:.4g} SCU"
+    return f"{clean:g} SCU"
+
+
+def _crafting_db_cache_path() -> Path:
+    return DATA_DIR / "crafting_db.json"
+
+
+def _parse_crafting_csv(text: str) -> dict[str, list[CraftingMaterialEntry]]:
+    reader = csv.DictReader(io.StringIO(text))
+    db: dict[str, list[CraftingMaterialEntry]] = {}
+    for row in reader:
+        name = str(row.get("Blueprint Name") or "").strip()
+        slot = str(row.get("Material Slot") or "").strip()
+        resource = str(row.get("Resource Name") or "").strip()
+        raw_qty = str(row.get("Quantity (SCU)") or "0").strip()
+        if not name or not resource:
+            continue
+        try:
+            qty = float(raw_qty)
+        except ValueError:
+            qty = 0.0
+        key = normalize_search_text(name)
+        db.setdefault(key, []).append(CraftingMaterialEntry(slot=slot, resource=resource, quantity=qty))
+    return db
+
+
+def _fetch_crafting_db_from_url() -> dict[str, list[CraftingMaterialEntry]]:
+    request = urllib.request.Request(CRAFTING_DB_URL, headers={"User-Agent": BLUEPRINT_WIKI_USER_AGENT})
+    with urllib.request.urlopen(request, timeout=CRAFTING_DB_TIMEOUT_SECONDS) as response:
+        text = response.read().decode("utf-8", errors="ignore")
+    return _parse_crafting_csv(text)
+
+
+def _load_crafting_db_from_cache() -> dict[str, list[CraftingMaterialEntry]] | None:
+    cache_path = _crafting_db_cache_path()
+    if not cache_path.exists():
+        return None
+    try:
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+        fetched_at = datetime.fromisoformat(str(payload.get("fetched_at", "")))
+        age_hours = (datetime.now() - fetched_at).total_seconds() / 3600
+        if age_hours > CRAFTING_DB_CACHE_MAX_AGE_HOURS:
+            return None  # Stale — will re-fetch
+        db: dict[str, list[CraftingMaterialEntry]] = {}
+        for key, items in (payload.get("entries") or {}).items():
+            db[key] = [CraftingMaterialEntry(**item) for item in items]
+        return db
+    except Exception:
+        return None
+
+
+def _save_crafting_db_to_cache(db: dict[str, list[CraftingMaterialEntry]]) -> None:
+    try:
+        entries_raw = {
+            key: [{"slot": e.slot, "resource": e.resource, "quantity": e.quantity} for e in items]
+            for key, items in db.items()
+        }
+        payload = {"fetched_at": datetime.now().isoformat(), "entries": entries_raw}
+        _crafting_db_cache_path().write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def ensure_crafting_db_loaded() -> dict[str, list[CraftingMaterialEntry]]:
+    """Return the crafting DB, loading from disk cache or fetching live if needed."""
+    global _crafting_db
+    if _crafting_db is not None:
+        return _crafting_db
+    cached = _load_crafting_db_from_cache()
+    if cached is not None:
+        _crafting_db = cached
+        return _crafting_db
+    db = _fetch_crafting_db_from_url()
+    _save_crafting_db_to_cache(db)
+    _crafting_db = db
+    return _crafting_db
+
+
+def lookup_crafting_materials(name: str) -> list[CraftingMaterialEntry] | None:
+    """Find crafting materials for a blueprint name using exact then fuzzy matching.
+
+    Uses the same word-coverage scoring as wiki resolution so variant names like
+    'A03 "Canuto" Sniper Rifle' correctly map to the base 'A03 Sniper Rifle' entry
+    when no exact match exists.
+    """
+    db = _crafting_db
+    if db is None:
+        return None
+    normalized = normalize_search_text(name)
+    if normalized in _crafting_lookup_cache:
+        return _crafting_lookup_cache[normalized]
+    # Exact match
+    if normalized in db:
+        result = db[normalized]
+        _crafting_lookup_cache[normalized] = result
+        return result
+    # Fuzzy match
+    query_words = set(normalized.split())
+    best_score, best_key = 0.0, None
+    for key in db:
+        key_words = set(key.split())
+        word_coverage = len(query_words & key_words) / len(query_words) if query_words else 0
+        score = word_coverage * 0.65 + difflib.SequenceMatcher(None, normalized, key).ratio() * 0.35
+        if score > best_score:
+            best_score, best_key = score, key
+    result = db[best_key] if best_key and best_score >= 0.72 else None
+    _crafting_lookup_cache[normalized] = result
+    return result
 
 
 def fuzzy_query_match(query: str, haystack: str) -> bool:
@@ -1296,6 +1436,7 @@ class StarStringsApp:
         self.blueprint_sort_desc = False
         self.selected_blueprint_record: BlueprintRecord | None = None
         self._search_debounce_job: str | None = None
+        self._crafting_db_loading = False
 
         self._build_style()
         self._build_ui()
@@ -2145,18 +2286,18 @@ class StarStringsApp:
         bp_results.columnconfigure(0, weight=1)
         bp_results.rowconfigure(1, weight=1)
         ttk.Label(bp_results, text="Blueprint Matches", style="CardTitle.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 10))
-        self.blueprint_tree = ttk.Treeview(bp_results, columns=("wiki", "blueprint", "type", "status", "contracts"), show="headings", height=12)
+        self.blueprint_tree = ttk.Treeview(bp_results, columns=("wiki", "blueprint", "type", "status", "materials"), show="headings", height=12)
         self.blueprint_tree.heading("wiki", text="SC Wiki")
         self.blueprint_tree.heading("blueprint", text="Blueprint", command=lambda: self._sort_blueprints("blueprint"))
         self.blueprint_tree.heading("type", text="Type  ▾", command=lambda: self._sort_blueprints("type"))
         self.blueprint_tree.heading("status", text="Status", command=lambda: self._sort_blueprints("status"))
-        self.blueprint_tree.heading("contracts", text="Contracts", command=lambda: self._sort_blueprints("contracts"))
+        self.blueprint_tree.heading("materials", text="Materials")
         self.blueprint_tree.grid(row=1, column=0, sticky="nsew")
         self.blueprint_tree.column("wiki", width=64, anchor="center", stretch=False)
         self.blueprint_tree.column("blueprint", width=340, anchor="w")
         self.blueprint_tree.column("type", width=120, anchor="w")
         self.blueprint_tree.column("status", width=100, anchor="w")
-        self.blueprint_tree.column("contracts", width=80, anchor="center")
+        self.blueprint_tree.column("materials", width=72, anchor="center", stretch=False)
         self.blueprint_tree.bind("<<TreeviewSelect>>", self._on_blueprint_selected)
         self.blueprint_tree.bind("<Button-1>", self._on_blueprint_tree_click)
         self.blueprint_tree.bind("<Return>", self._open_selected_blueprint_wiki)
@@ -2433,7 +2574,7 @@ class StarStringsApp:
                 "",
                 "end",
                 iid=f"bp-{index}",
-                values=("🔗", record.name, record.category, record.status, len(record.contracts)),
+                values=("🔗", record.name, record.category, record.status, "⚒"),
                 tags=("learned",) if record.learned else (),
             )
 
@@ -2456,8 +2597,6 @@ class StarStringsApp:
             if sort_key == "status":
                 status_order = {"Learned": 0, "Missing": 1, "Unknown": 2}
                 return (status_order.get(record.status, 9), record.name.lower())
-            if sort_key == "contracts":
-                return (len(record.contracts), record.name.lower())
             return record.name.lower()
 
         self.filtered_blueprint_records.sort(key=key_func, reverse=self.blueprint_sort_desc)
@@ -2530,6 +2669,8 @@ class StarStringsApp:
             threading.Thread(target=worker, daemon=True).start()
         elif column == "#3":  # Type column
             self._show_inline_type_combobox(item_id, column, record)
+        elif column == "#5":  # Materials column
+            self._on_materials_click(record)
 
     def _show_inline_type_combobox(self, item_id: str, column: str, record: BlueprintRecord) -> None:
         """Show a dark-themed popup listbox anchored below the Type cell."""
@@ -2620,6 +2761,131 @@ class StarStringsApp:
             self.state.blueprint_category_overrides.pop(record.normalized_name, None)
         save_state(self.state)
         self._refresh_blueprint_list()
+
+    def _on_materials_click(self, record: BlueprintRecord) -> None:
+        """Show crafting materials for the clicked blueprint, loading the DB if needed."""
+        if _crafting_db is None:
+            if self._crafting_db_loading:
+                return
+            self._crafting_db_loading = True
+            self.blueprint_status_var.set("Fetching crafting database...")
+
+            def worker():
+                try:
+                    ensure_crafting_db_loaded()
+                    self.root.after(0, lambda r=record: self._on_crafting_db_ready(r))
+                except Exception as exc:
+                    self.root.after(0, lambda e=exc: self._on_crafting_db_error(e))
+
+            threading.Thread(target=worker, daemon=True).start()
+            return
+        self._show_crafting_popup(record)
+
+    def _on_crafting_db_ready(self, record: BlueprintRecord) -> None:
+        self._crafting_db_loading = False
+        self.blueprint_status_var.set("Crafting database loaded.")
+        self._show_crafting_popup(record)
+
+    def _on_crafting_db_error(self, exc: Exception) -> None:
+        self._crafting_db_loading = False
+        self.blueprint_status_var.set("Could not load crafting database.")
+        self.append_log(f"Crafting database fetch failed: {exc}")
+
+    def _show_crafting_popup(self, record: BlueprintRecord) -> None:
+        materials = lookup_crafting_materials(record.name)
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title(f"Crafting Materials")
+        dialog.configure(bg="#0d1219")
+        dialog.resizable(False, False)
+        dialog.transient(self.root)
+
+        # Gold accent stripe
+        tk.Frame(dialog, bg="#c09040", height=2).pack(fill="x", side="top")
+
+        content = tk.Frame(dialog, bg="#0d1219")
+        content.pack(fill="both", expand=True, padx=24, pady=(18, 10))
+
+        tk.Label(
+            content, text=record.name,
+            fg="#e8edf2", bg="#0d1219",
+            font=("Segoe UI Semibold", 11), anchor="w",
+        ).pack(fill="x")
+        tk.Label(
+            content, text="Crafting Materials",
+            fg="#6e8096", bg="#0d1219",
+            font=("Segoe UI", 9), anchor="w",
+        ).pack(fill="x", pady=(2, 14))
+
+        if not materials:
+            tk.Label(
+                content,
+                text="No crafting data found for this blueprint.",
+                fg="#6e8096", bg="#0d1219",
+                font=("Segoe UI", 9),
+            ).pack(anchor="w")
+        else:
+            # Column header row
+            hdr = tk.Frame(content, bg="#162030")
+            hdr.pack(fill="x", pady=(0, 2))
+            for label, w, anchor in (("SLOT", 160, "w"), ("MATERIAL", 160, "w"), ("QUANTITY", 90, "e")):
+                tk.Label(
+                    hdr, text=label,
+                    fg="#c09040", bg="#162030",
+                    font=("Segoe UI Semibold", 8),
+                    width=0, anchor=anchor, padx=10, pady=5,
+                ).pack(side="left", ipadx=0)
+                # Spacer to reach fixed width
+                tk.Frame(hdr, bg="#162030", width=w).pack(side="left")
+
+            # Clear the spacer approach — use a grid Frame instead
+            hdr.destroy()
+            hdr = tk.Frame(content, bg="#162030")
+            hdr.pack(fill="x", pady=(0, 2))
+            hdr.columnconfigure(0, minsize=170)
+            hdr.columnconfigure(1, minsize=170)
+            hdr.columnconfigure(2, minsize=90)
+            tk.Label(hdr, text="SLOT",     fg="#c09040", bg="#162030", font=("Segoe UI Semibold", 8), anchor="w", padx=10, pady=5).grid(row=0, column=0, sticky="ew")
+            tk.Label(hdr, text="MATERIAL", fg="#c09040", bg="#162030", font=("Segoe UI Semibold", 8), anchor="w", padx=10, pady=5).grid(row=0, column=1, sticky="ew")
+            tk.Label(hdr, text="QUANTITY", fg="#c09040", bg="#162030", font=("Segoe UI Semibold", 8), anchor="e", padx=10, pady=5).grid(row=0, column=2, sticky="ew")
+
+            # Material rows
+            for i, mat in enumerate(materials):
+                row_bg = "#0d1219" if i % 2 == 0 else "#111922"
+                row = tk.Frame(content, bg=row_bg)
+                row.pack(fill="x")
+                row.columnconfigure(0, minsize=170)
+                row.columnconfigure(1, minsize=170)
+                row.columnconfigure(2, minsize=90)
+                tk.Label(row, text=mat.slot,              fg="#e8edf2", bg=row_bg, font=("Segoe UI", 9), anchor="w", padx=10, pady=4).grid(row=0, column=0, sticky="ew")
+                tk.Label(row, text=mat.resource,          fg="#e8edf2", bg=row_bg, font=("Segoe UI", 9), anchor="w", padx=10, pady=4).grid(row=0, column=1, sticky="ew")
+                tk.Label(row, text=format_scu(mat.quantity), fg="#c09040", bg=row_bg, font=("Segoe UI Semibold", 9), anchor="e", padx=10, pady=4).grid(row=0, column=2, sticky="ew")
+
+        tk.Label(
+            content,
+            text="Data sourced from community crafting database.",
+            fg="#3a4a5a", bg="#0d1219",
+            font=("Segoe UI", 8),
+        ).pack(anchor="w", pady=(12, 0))
+
+        btn_row = tk.Frame(dialog, bg="#0d1219")
+        btn_row.pack(fill="x", padx=24, pady=(4, 18))
+        tk.Button(
+            btn_row, text="Close", command=dialog.destroy,
+            bg="#162030", fg="#e8edf2",
+            activebackground="#1e2d3d", activeforeground="#e8edf2",
+            relief="flat", padx=14, pady=8,
+            font=("Segoe UI Semibold", 9), cursor="hand2", bd=0,
+        ).pack(side="right")
+
+        dialog.update_idletasks()
+        w = max(dialog.winfo_reqwidth(), 460)
+        h = dialog.winfo_reqheight()
+        x = self.root.winfo_x() + (self.root.winfo_width() - w) // 2
+        y = self.root.winfo_y() + (self.root.winfo_height() - h) // 2
+        dialog.geometry(f"{w}x{h}+{x}+{y}")
+        apply_dark_titlebar(dialog)
+        dialog.grab_set()
 
     def _schedule_blueprint_search(self) -> None:
         """Debounce blueprint search box keystrokes (150 ms) to avoid O(n) work per key."""
