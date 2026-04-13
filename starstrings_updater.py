@@ -41,7 +41,7 @@ LEGACY_TASK_NAMES = (
 DEFAULT_LIVE_PATH = r"C:\Program Files\Roberts Space Industries\StarCitizen\LIVE"
 DEFAULT_REPO = "https://github.com/MrKraken/StarStrings"
 APP_UPDATE_REPO = "aj3/CitizenStarStringHelper-v2"
-APP_VERSION = "2.2.4"
+APP_VERSION = "2.2.5"
 APP_UPDATE_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000
 BLUEPRINT_SCAN_INTERVAL_MS = 15 * 60 * 1000
 LANGUAGE_LINE = "g_language = english."
@@ -1413,6 +1413,8 @@ class StarStringsApp:
         self.tray_thread: threading.Thread | None = None
         self.is_quitting = False
         self.is_restoring = False
+        self.minimize_job: str | None = None
+        self.suppress_minimize_until = 0.0
         self.icon_image = self._load_icon_image()
         cleanup_pending_update_artifacts()
 
@@ -1605,6 +1607,13 @@ class StarStringsApp:
 
     def _restore_window(self) -> None:
         self.is_restoring = True
+        self.suppress_minimize_until = time.monotonic() + 1.0
+        if self.minimize_job is not None:
+            try:
+                self.root.after_cancel(self.minimize_job)
+            except Exception:
+                pass
+            self.minimize_job = None
         self._stop_tray_icon()
         ensure_taskbar_window(self.root)
         self.root.deiconify()
@@ -2076,7 +2085,21 @@ class StarStringsApp:
         tray_image = self.icon_image.copy() if self.icon_image else Image.new("RGBA", (64, 64), "#143044")
         tray_image = tray_image.resize((64, 64), Image.LANCZOS)
         menu = pystray.Menu(
+            pystray.MenuItem("Window", None, enabled=False),
             pystray.MenuItem("Open", self._show_window, default=True),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("StarStrings", None, enabled=False),
+            pystray.MenuItem("Update StarStrings", self._run_manual_update_from_tray),
+            pystray.MenuItem("StarStrings Auto Update: On/Off", self._toggle_schedule_from_tray),
+            pystray.MenuItem("Restore Previous Backup", self._restore_backup_from_tray),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Blueprints", None, enabled=False),
+            pystray.MenuItem("Scan Blueprints", self._scan_blueprints_from_tray),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Application", None, enabled=False),
+            pystray.MenuItem("Open Log Folder", self._open_log_folder_from_tray),
+            pystray.MenuItem("Update Application", self._check_app_update_from_tray),
+            pystray.Menu.SEPARATOR,
             pystray.MenuItem("Exit", self._quit_from_tray),
         )
         self.tray_icon = pystray.Icon("CitizenStarStringHelper", tray_image, APP_NAME, menu)
@@ -2101,6 +2124,44 @@ class StarStringsApp:
         remove_appwindow_style(self.root)
         self.root.withdraw()
 
+    def _scan_blueprints_from_tray(self, *_args) -> None:
+        self.root.after(0, self._scan_blueprints_from_tray_ui)
+
+    def _run_manual_update_from_tray(self, *_args) -> None:
+        self.root.after(0, self._run_manual_update_from_tray_ui)
+
+    def _check_app_update_from_tray(self, *_args) -> None:
+        self.root.after(0, self._check_app_update_from_tray_ui)
+
+    def _open_log_folder_from_tray(self, *_args) -> None:
+        self.root.after(0, self._open_log_folder)
+
+    def _toggle_schedule_from_tray(self, *_args) -> None:
+        self.root.after(0, self.toggle_schedule)
+
+    def _restore_backup_from_tray(self, *_args) -> None:
+        self.root.after(0, self._restore_backup_from_tray_ui)
+
+    def _scan_blueprints_from_tray_ui(self) -> None:
+        self._restore_window()
+        self._show_view("blueprints")
+        self.root.after(100, lambda: self.scan_blueprints(silent=False))
+
+    def _run_manual_update_from_tray_ui(self) -> None:
+        self._restore_window()
+        self._show_view("setup")
+        self.root.after(100, self.run_manual_update)
+
+    def _check_app_update_from_tray_ui(self) -> None:
+        self._restore_window()
+        self._show_view("activity")
+        self.root.after(100, self.check_for_app_update)
+
+    def _restore_backup_from_tray_ui(self) -> None:
+        self._restore_window()
+        self._show_view("setup")
+        self.root.after(100, self._open_restore_backup_dialog)
+
     def _handle_map(self, _event) -> None:
         if self.is_restoring:
             return
@@ -2108,19 +2169,33 @@ class StarStringsApp:
     def _handle_unmap(self, _event) -> None:
         if self.is_quitting or self.is_restoring:
             return
+        if time.monotonic() < self.suppress_minimize_until:
+            return
         state = self.root.state()
-        if state == "iconic":
-            self.root.after(10, self._handle_minimize)
+        if state == "iconic" and self.minimize_job is None:
+            self.minimize_job = self.root.after(10, self._handle_minimize)
 
     def _handle_configure(self, _event) -> None:
         if self.is_quitting or self.is_restoring:
             return
-        if self.root.state() == "iconic":
-            self.root.after(10, self._handle_minimize)
+        if time.monotonic() < self.suppress_minimize_until:
+            return
+        if self.root.state() == "iconic" and self.minimize_job is None:
+            self.minimize_job = self.root.after(10, self._handle_minimize)
 
     def _handle_minimize(self) -> None:
+        self.minimize_job = None
         if self.is_quitting or self.is_restoring:
             return
+        if time.monotonic() < self.suppress_minimize_until:
+            return
+        if self.root.state() != "iconic":
+            return
+        try:
+            self.root.state("normal")
+            self.root.update_idletasks()
+        except Exception:
+            pass
         self._minimize_to_tray()
 
     def _handle_close(self) -> None:
