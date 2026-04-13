@@ -40,7 +40,7 @@ LEGACY_TASK_NAMES = (
 DEFAULT_LIVE_PATH = r"C:\Program Files\Roberts Space Industries\StarCitizen\LIVE"
 DEFAULT_REPO = "https://github.com/MrKraken/StarStrings"
 APP_UPDATE_REPO = "aj3/CitizenStarStringHelper-v2"
-APP_VERSION = "2.2.1"
+APP_VERSION = "2.2.2"
 APP_UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000
 BLUEPRINT_SCAN_INTERVAL_MS = 15 * 60 * 1000
 LANGUAGE_LINE = "g_language = english."
