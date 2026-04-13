@@ -44,8 +44,12 @@ jobs:
           name: unsigned-exe
           path: dist\Citizen StarString Helper.exe
 
+      # SignPath signing is optional — only runs when SIGNPATH_ORG_ID is configured.
+      # Until the OSS certificate is approved, this step is skipped and the release
+      # is published with the unsigned executable instead.
       - name: Sign with SignPath
         id: sign
+        if: ${{ vars.SIGNPATH_ORG_ID != '' }}
         uses: signpath/github-action-submit-signing-request@v2
         with:
           api-token: '${{ secrets.SIGNPATH_API_TOKEN }}'
@@ -57,9 +61,22 @@ jobs:
           wait-for-completion: true
           output-artifact-directory: './signed'
 
+      - name: Prepare release asset
+        id: asset
+        shell: bash
+        run: |
+          if [ -f "signed/Citizen StarString Helper.exe" ]; then
+            echo "path=signed/Citizen StarString Helper.exe" >> $GITHUB_OUTPUT
+            echo "label=Citizen StarString Helper (signed).exe" >> $GITHUB_OUTPUT
+          else
+            cp "dist/Citizen StarString Helper.exe" "Citizen StarString Helper.exe"
+            echo "path=Citizen StarString Helper.exe" >> $GITHUB_OUTPUT
+            echo "label=Citizen StarString Helper.exe" >> $GITHUB_OUTPUT
+          fi
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: signed/Citizen StarString Helper.exe
+          files: ${{ steps.asset.outputs.path }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
