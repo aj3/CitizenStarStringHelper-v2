@@ -14,6 +14,7 @@ import tempfile
 import threading
 import time
 import tkinter as tk
+import tkinter.font as tkfont
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -40,8 +41,8 @@ LEGACY_TASK_NAMES = (
 DEFAULT_LIVE_PATH = r"C:\Program Files\Roberts Space Industries\StarCitizen\LIVE"
 DEFAULT_REPO = "https://github.com/MrKraken/StarStrings"
 APP_UPDATE_REPO = "aj3/CitizenStarStringHelper-v2"
-APP_VERSION = "2.2.3"
-APP_UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000
+APP_VERSION = "2.2.4"
+APP_UPDATE_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000
 BLUEPRINT_SCAN_INTERVAL_MS = 15 * 60 * 1000
 LANGUAGE_LINE = "g_language = english."
 REFERRAL_URL = "https://www.robertsspaceindustries.com/enlist?referral=STAR-J66D-SPVW"
@@ -239,6 +240,7 @@ class State:
     blueprints_last_scanned_release_id: str = ""
     blueprints_last_scanned_release_name: str = ""
     blueprint_category_overrides: dict[str, str] | None = None
+    blueprint_status_overrides: dict[str, str] | None = None
     learned_blueprint_memory: dict[str, str] | None = None
 
 
@@ -268,6 +270,7 @@ class BlueprintRecord:
     normalized_name: str
     inferred_category: str
     category_override: str
+    status_override: str
     contracts: list[str]
     learned: bool
     learned_count: int
@@ -279,6 +282,8 @@ class BlueprintRecord:
 
     @property
     def status(self) -> str:
+        if self.status_override:
+            return self.status_override
         if self.learned:
             return "Learned"
         if self.contracts:
@@ -695,6 +700,11 @@ def load_state() -> State:
                 for key, value in (data.get("blueprint_category_overrides") or {}).items()
                 if isinstance(key, str) and isinstance(value, str)
             },
+            blueprint_status_overrides={
+                str(key): str(value)
+                for key, value in (data.get("blueprint_status_overrides") or {}).items()
+                if isinstance(key, str) and isinstance(value, str)
+            },
             learned_blueprint_memory={
                 str(key): str(value)
                 for key, value in (data.get("learned_blueprint_memory") or {}).items()
@@ -719,6 +729,7 @@ def save_state(state: State) -> None:
                 "blueprints_last_scanned_release_id": state.blueprints_last_scanned_release_id,
                 "blueprints_last_scanned_release_name": state.blueprints_last_scanned_release_name,
                 "blueprint_category_overrides": state.blueprint_category_overrides or {},
+                "blueprint_status_overrides": state.blueprint_status_overrides or {},
                 "learned_blueprint_memory": state.learned_blueprint_memory or {},
             },
             indent=2,
@@ -863,7 +874,8 @@ def collect_blueprint_records(live_path: str) -> tuple[list[BlueprintRecord], di
     starstrings_records, global_ini_path = parse_starstrings_blueprints(live_path)
     learned_records, log_paths = parse_learned_blueprints(live_path)
     state = load_state()
-    overrides = state.blueprint_category_overrides or {}
+    category_overrides = state.blueprint_category_overrides or {}
+    status_overrides = state.blueprint_status_overrides or {}
     learned_memory = state.learned_blueprint_memory or {}
 
     for key, saved_name in learned_memory.items():
@@ -896,7 +908,8 @@ def collect_blueprint_records(live_path: str) -> tuple[list[BlueprintRecord], di
                 name=display_name,
                 normalized_name=key,
                 inferred_category=infer_blueprint_category(display_name),
-                category_override=overrides.get(key, ""),
+                category_override=category_overrides.get(key, ""),
+                status_override=status_overrides.get(key, ""),
                 contracts=contracts,
                 learned=bool(learned_record),
                 learned_count=int(learned_record.get("count") or 0),
@@ -907,9 +920,9 @@ def collect_blueprint_records(live_path: str) -> tuple[list[BlueprintRecord], di
     metadata = {
         "global_ini_path": global_ini_path,
         "log_paths": log_paths,
-        "learned_count": sum(1 for record in results if record.learned),
+        "learned_count": sum(1 for record in results if record.status == "Learned"),
         "available_count": sum(1 for record in results if record.contracts),
-        "missing_count": sum(1 for record in results if record.contracts and not record.learned),
+        "missing_count": sum(1 for record in results if record.status == "Missing"),
         "total_count": len(results),
         "scanned_at": datetime.now().isoformat(),
         "tracked_release_id": state.tracked_release_id,
@@ -1405,8 +1418,8 @@ class StarStringsApp:
 
         self.root = Tk()
         self.root.title(APP_NAME)
-        self.root.geometry("900x940")
-        self.root.minsize(840, 880)
+        self.root.geometry("675x846")
+        self.root.minsize(630, 792)
         self.root.configure(bg="#080c10")
         self.root.after(50, lambda: ensure_taskbar_window(self.root))
         self.root.after(100, lambda: apply_dark_titlebar(self.root))
@@ -1433,6 +1446,7 @@ class StarStringsApp:
         self.blueprint_type_filter_var = StringVar(value="All Types")
         self.blueprint_status_var = StringVar(value="Scan your StarStrings data to see available and learned blueprints.")
         self.blueprint_summary_var = StringVar(value="No blueprint scan has been run yet.")
+        self.blueprint_summary_display_var = StringVar(value=self.blueprint_summary_var.get())
         self.blueprint_detail_title_var = StringVar(value="Select a blueprint")
         self.blueprint_detail_status_var = StringVar(value="")
         self.app_update_button_var = StringVar(value="Check for Updates")
@@ -1444,6 +1458,7 @@ class StarStringsApp:
         self.blueprint_auto_scan_job: str | None = None
         self.settings_save_job: str | None = None
         self._app_update_checking = False  # guard against concurrent update checks
+        self.blueprint_summary_var.trace_add("write", self._on_blueprint_summary_changed)
         self.settings_loaded = False
         self.current_view = "setup"
         self.inline_info_labels: list[ttk.Label] = []
@@ -1525,6 +1540,9 @@ class StarStringsApp:
 
         style.configure("Secondary.TButton",      background=BTN,     foreground=FG,        font=("Segoe UI Semibold", 9), **_btn_opts)
         style.map(       "Secondary.TButton",      background=[("active", BTN_H)])
+
+        style.configure("Danger.TButton",         background="#632229", foreground="#fde8e8", font=("Segoe UI Semibold", 9), **_btn_opts)
+        style.map(       "Danger.TButton",         background=[("active", "#7a2a08")])
 
         style.configure("AppUpdateIdle.TButton",  background=BTN,     foreground=FG,        font=("Segoe UI Semibold", 9), **_btn_opts)
         style.map(       "AppUpdateIdle.TButton",  background=[("active", BTN_H)])
@@ -1775,6 +1793,155 @@ class StarStringsApp:
         apply_dark_titlebar(dialog)
         dialog.grab_set()
         tick()
+
+    def _show_themed_message_dialog(
+        self,
+        *,
+        title: str,
+        heading: str,
+        body: str,
+        accent: str = "#c09040",
+        button_text: str = "Close",
+    ) -> None:
+        dialog = tk.Toplevel(self.root)
+        dialog.title(title)
+        dialog.configure(bg="#0d1219")
+        dialog.resizable(False, False)
+        dialog.transient(self.root)
+        dialog.minsize(500, 220)
+        tk.Frame(dialog, bg=accent, height=2).pack(fill="x", side="top")
+
+        content = tk.Frame(dialog, bg="#0d1219")
+        content.pack(fill="both", expand=True, padx=24, pady=20)
+        tk.Label(
+            content,
+            text=heading,
+            fg="#e8edf2",
+            bg="#0d1219",
+            font=("Segoe UI Semibold", 12),
+        ).pack(anchor="w")
+        tk.Label(
+            content,
+            text=body,
+            fg="#6e8096",
+            bg="#0d1219",
+            font=("Segoe UI", 9),
+            wraplength=440,
+            justify="left",
+        ).pack(anchor="w", pady=(8, 0))
+
+        btn_row = tk.Frame(dialog, bg="#0d1219")
+        btn_row.pack(fill="x", padx=24, pady=(0, 20))
+        tk.Button(
+            btn_row,
+            text=button_text,
+            command=dialog.destroy,
+            bg="#162030",
+            fg="#e8edf2",
+            activebackground="#1e2d3d",
+            activeforeground="#e8edf2",
+            relief="flat",
+            padx=16,
+            pady=8,
+            font=("Segoe UI Semibold", 9),
+            cursor="hand2",
+            bd=0,
+        ).pack(side="right")
+
+        dialog.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width() - dialog.winfo_width()) // 2
+        y = self.root.winfo_y() + (self.root.winfo_height() - dialog.winfo_height()) // 2
+        dialog.geometry(f"+{x}+{y}")
+        apply_dark_titlebar(dialog)
+        dialog.grab_set()
+        self.root.wait_window(dialog)
+
+    def _ask_themed_confirmation(
+        self,
+        *,
+        title: str,
+        heading: str,
+        body: str,
+        accent: str = "#7a2a08",
+        confirm_text: str = "Continue",
+        cancel_text: str = "Cancel",
+    ) -> bool:
+        dialog = tk.Toplevel(self.root)
+        dialog.title(title)
+        dialog.configure(bg="#0d1219")
+        dialog.resizable(False, False)
+        dialog.transient(self.root)
+        dialog.minsize(540, 250)
+        tk.Frame(dialog, bg=accent, height=2).pack(fill="x", side="top")
+
+        result = {"value": False}
+
+        content = tk.Frame(dialog, bg="#0d1219")
+        content.pack(fill="both", expand=True, padx=24, pady=20)
+        tk.Label(
+            content,
+            text=heading,
+            fg="#e8edf2",
+            bg="#0d1219",
+            font=("Segoe UI Semibold", 12),
+        ).pack(anchor="w")
+        tk.Label(
+            content,
+            text=body,
+            fg="#6e8096",
+            bg="#0d1219",
+            font=("Segoe UI", 9),
+            wraplength=480,
+            justify="left",
+        ).pack(anchor="w", pady=(8, 0))
+
+        btn_row = tk.Frame(dialog, bg="#0d1219")
+        btn_row.pack(fill="x", padx=24, pady=(0, 20))
+
+        def close_with(value: bool) -> None:
+            result["value"] = value
+            dialog.destroy()
+
+        tk.Button(
+            btn_row,
+            text=cancel_text,
+            command=lambda: close_with(False),
+            bg="#162030",
+            fg="#e8edf2",
+            activebackground="#1e2d3d",
+            activeforeground="#e8edf2",
+            relief="flat",
+            padx=16,
+            pady=8,
+            font=("Segoe UI Semibold", 9),
+            cursor="hand2",
+            bd=0,
+        ).pack(side="right")
+        tk.Button(
+            btn_row,
+            text=confirm_text,
+            command=lambda: close_with(True),
+            bg=accent,
+            fg="#fff7ed",
+            activebackground="#9a3c10",
+            activeforeground="#fff7ed",
+            relief="flat",
+            padx=16,
+            pady=8,
+            font=("Segoe UI Semibold", 9),
+            cursor="hand2",
+            bd=0,
+        ).pack(side="right", padx=(0, 10))
+
+        dialog.protocol("WM_DELETE_WINDOW", lambda: close_with(False))
+        dialog.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width() - dialog.winfo_width()) // 2
+        y = self.root.winfo_y() + (self.root.winfo_height() - dialog.winfo_height()) // 2
+        dialog.geometry(f"+{x}+{y}")
+        apply_dark_titlebar(dialog)
+        dialog.grab_set()
+        self.root.wait_window(dialog)
+        return result["value"]
 
     def _open_restore_backup_dialog(self) -> None:
         backups = list_backups()
@@ -2221,7 +2388,7 @@ class StarStringsApp:
         ttk.Button(activity_button_row, text="Open App Folder", style="Secondary.TButton", command=self._open_current_app_folder).grid(row=0, column=1, sticky="ew", padx=(8, 0), pady=(0, 8))
         ttk.Button(activity_button_row, text="Open Log Folder", style="Secondary.TButton", command=self._open_log_folder).grid(row=1, column=0, sticky="ew", padx=(0, 8))
         ttk.Button(activity_button_row, text="Clear Log", style="Secondary.TButton", command=self._clear_log).grid(row=1, column=1, sticky="ew", padx=(8, 0))
-        ttk.Button(activity_button_row, text="Reset Learned Blueprints", style="Secondary.TButton", command=self._reset_learned_blueprints_with_confirmation).grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        ttk.Button(activity_button_row, text="Reset Learned Blueprints", style="Danger.TButton", command=self._reset_learned_blueprints_with_confirmation).grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
 
         ops_meta = ttk.Label(feed_card, textvariable=self.operations_meta_var, style="Muted.TLabel", wraplength=860, justify="left")
         ops_meta.grid(row=2, column=0, sticky="w", pady=(0, 2))
@@ -2244,81 +2411,90 @@ class StarStringsApp:
         blueprints = ttk.Frame(self.content_host, style="Root.TFrame")
         blueprints.grid(row=0, column=0, sticky="nsew")
         blueprints.columnconfigure(0, weight=1)
+        blueprints.rowconfigure(1, weight=1)
         blueprints.rowconfigure(2, weight=1)
-        blueprints.rowconfigure(3, weight=1)
 
         bp_toolbar = ttk.Frame(blueprints, style="Card.TFrame", padding=16)
         bp_toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 12))
-        bp_toolbar.columnconfigure(1, weight=1)
+        bp_toolbar.columnconfigure(1, weight=11)
         bp_toolbar.columnconfigure(3, weight=0)
         bp_toolbar.columnconfigure(5, weight=0)
         bp_toolbar.columnconfigure(7, weight=0)
         bp_toolbar.columnconfigure(9, weight=0)
 
-        ttk.Label(bp_toolbar, text="Blueprints", style="SectionTitle.TLabel").grid(row=0, column=0, columnspan=10, sticky="w")
-        ttk.Label(bp_toolbar, text="Search learned and mission-linked blueprints from your installed StarStrings data.", style="Muted.TLabel").grid(row=1, column=0, columnspan=10, sticky="w", pady=(4, 12))
-        ttk.Label(bp_toolbar, text="SEARCH", style="SmallAccent.TLabel").grid(row=2, column=0, sticky="w", padx=(0, 10))
+        ttk.Label(bp_toolbar, text="SEARCH", style="SmallAccent.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 10))
         search_entry = ttk.Entry(bp_toolbar, textvariable=self.blueprint_search_var, font=("Segoe UI", 10))
-        search_entry.grid(row=2, column=1, sticky="ew", padx=(0, 12))
-        ttk.Label(bp_toolbar, text="FILTER", style="SmallAccent.TLabel").grid(row=2, column=2, sticky="w", padx=(0, 10))
+        search_entry.grid(row=0, column=1, sticky="ew", padx=(0, 12))
+        ttk.Label(bp_toolbar, text="FILTER", style="SmallAccent.TLabel").grid(row=0, column=2, sticky="w", padx=(0, 10))
         self.blueprint_filter_combo = ttk.Combobox(
             bp_toolbar,
             state="readonly",
             values=("All", "Learned", "Missing"),
             textvariable=self.blueprint_filter_var,
-            width=18,
+            width=11,
             font=("Segoe UI", 9),
         )
-        self.blueprint_filter_combo.grid(row=2, column=3, sticky="ew", padx=(0, 12))
+        self.blueprint_filter_combo.grid(row=0, column=3, sticky="ew", padx=(0, 12))
         self.blueprint_filter_combo.bind("<<ComboboxSelected>>", lambda _event: self._refresh_blueprint_list())
-        ttk.Label(bp_toolbar, text="TYPE", style="SmallAccent.TLabel").grid(row=2, column=4, sticky="w", padx=(0, 10))
+        ttk.Label(bp_toolbar, text="TYPE", style="SmallAccent.TLabel").grid(row=0, column=4, sticky="w", padx=(0, 10))
         self.blueprint_type_filter_combo = ttk.Combobox(
             bp_toolbar,
             state="readonly",
             values=("All Types", "Armor", "Weapon", "Ammo", "Clothing", "Med", "Tool", "Attachment", "Component", "Unknown"),
             textvariable=self.blueprint_type_filter_var,
-            width=14,
+            width=11,
             font=("Segoe UI", 9),
         )
-        self.blueprint_type_filter_combo.grid(row=2, column=5, sticky="ew", padx=(0, 12))
+        self.blueprint_type_filter_combo.grid(row=0, column=5, sticky="ew", padx=(0, 12))
         self.blueprint_type_filter_combo.bind("<<ComboboxSelected>>", lambda _event: self._refresh_blueprint_list())
         self.blueprint_scan_button = ttk.Button(bp_toolbar, text="Scan Blueprints", style="Primary.TButton", command=self.scan_blueprints)
-        self.blueprint_scan_button.grid(row=2, column=6, sticky="ew")
-
-        ttk.Label(bp_toolbar, textvariable=self.blueprint_status_var, style="Muted.TLabel").grid(row=3, column=0, columnspan=7, sticky="w", pady=(12, 0))
-
-        bp_summary = ttk.Frame(blueprints, style="Card.TFrame", padding=12)
-        bp_summary.grid(row=1, column=0, sticky="ew", pady=(0, 12))
-        bp_summary.columnconfigure(0, weight=1)
-        ttk.Label(bp_summary, textvariable=self.blueprint_summary_var, style="MutedSide.TLabel").grid(row=0, column=0, sticky="w")
+        self.blueprint_scan_button.grid(row=0, column=6, sticky="ew")
+        self.blueprint_summary_font = tkfont.Font(family="Segoe UI", size=8)
+        self.blueprint_summary_label = tk.Label(
+            bp_toolbar,
+            textvariable=self.blueprint_summary_display_var,
+            fg="#6e8096",
+            bg="#0d1219",
+            font=self.blueprint_summary_font,
+            justify="left",
+            anchor="w",
+        )
+        self.blueprint_summary_label.grid(row=1, column=0, columnspan=7, sticky="ew", pady=(10, 0))
 
         bp_results = ttk.Frame(blueprints, style="Card.TFrame", padding=14)
-        bp_results.grid(row=2, column=0, sticky="nsew", pady=(0, 12))
+        bp_results.grid(row=1, column=0, sticky="nsew", pady=(0, 12))
         bp_results.columnconfigure(0, weight=1)
         bp_results.rowconfigure(1, weight=1)
         ttk.Label(bp_results, text="Blueprint Matches", style="CardTitle.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 10))
         self.blueprint_tree = ttk.Treeview(bp_results, columns=("wiki", "blueprint", "type", "status", "materials"), show="headings", height=12)
         self.blueprint_tree.heading("wiki", text="SC Wiki")
         self.blueprint_tree.heading("blueprint", text="Blueprint", command=lambda: self._sort_blueprints("blueprint"))
-        self.blueprint_tree.heading("type", text="Type  ▾", command=lambda: self._sort_blueprints("type"))
+        self.blueprint_tree.heading("type", text="Type", command=lambda: self._sort_blueprints("type"))
         self.blueprint_tree.heading("status", text="Status", command=lambda: self._sort_blueprints("status"))
         self.blueprint_tree.heading("materials", text="Materials")
         self.blueprint_tree.grid(row=1, column=0, sticky="nsew")
-        self.blueprint_tree.column("wiki", width=64, anchor="center", stretch=False)
-        self.blueprint_tree.column("blueprint", width=340, anchor="w")
-        self.blueprint_tree.column("type", width=120, anchor="w")
-        self.blueprint_tree.column("status", width=100, anchor="w")
-        self.blueprint_tree.column("materials", width=72, anchor="center", stretch=False)
+        self.blueprint_tree.column("wiki", width=58, anchor="center", stretch=False)
+        self.blueprint_tree.column("blueprint", width=246, anchor="w")
+        self.blueprint_tree.column("type", width=110, anchor="w")
+        self.blueprint_tree.column("status", width=90, anchor="w")
+        self.blueprint_tree.column("materials", width=84, anchor="center", stretch=False)
         self.blueprint_tree.bind("<<TreeviewSelect>>", self._on_blueprint_selected)
         self.blueprint_tree.bind("<Button-1>", self._on_blueprint_tree_click)
+        self.blueprint_tree.bind("<Motion>", self._on_blueprint_tree_motion)
+        self.blueprint_tree.bind("<Leave>", lambda _event: self.blueprint_tree.configure(cursor=""))
         self.blueprint_tree.bind("<Return>", self._open_selected_blueprint_wiki)
         self.blueprint_tree.tag_configure("learned", background="#153225", foreground="#dff8e8")
         bp_scroll = ttk.Scrollbar(bp_results, orient="vertical", command=self.blueprint_tree.yview)
         self.blueprint_tree.configure(yscrollcommand=bp_scroll.set)
         bp_scroll.grid(row=1, column=1, sticky="ns")
+        ttk.Label(
+            bp_results,
+            text="Tip: click SC Wiki, Type, Status, or Materials cells for quick actions.",
+            style="Muted.TLabel",
+        ).grid(row=2, column=0, sticky="w", pady=(8, 0))
 
         bp_detail = ttk.Frame(blueprints, style="SideCard.TFrame", padding=16)
-        bp_detail.grid(row=3, column=0, sticky="nsew")
+        bp_detail.grid(row=2, column=0, sticky="nsew")
         bp_detail.columnconfigure(0, weight=1)
         ttk.Label(bp_detail, textvariable=self.blueprint_detail_title_var, style="CardTitle.TLabel").grid(row=0, column=0, sticky="w")
         ttk.Label(bp_detail, text="Possible Contract Sources", style="SmallAccent.TLabel").grid(row=1, column=0, sticky="w", pady=(8, 6))
@@ -2357,6 +2533,46 @@ class StarStringsApp:
                 label.configure(wraplength=meta_wrap)
             except Exception:
                 pass
+        self._refresh_blueprint_summary_line()
+
+    def _on_blueprint_summary_changed(self, *_args) -> None:
+        self._refresh_blueprint_summary_line()
+
+    def _refresh_blueprint_summary_line(self) -> None:
+        label = getattr(self, "blueprint_summary_label", None)
+        font = getattr(self, "blueprint_summary_font", None)
+        source_var = getattr(self, "blueprint_summary_var", None)
+        display_var = getattr(self, "blueprint_summary_display_var", None)
+        if not label or not font or not source_var or not display_var:
+            return
+
+        try:
+            available_width = label.winfo_width()
+        except Exception:
+            available_width = 0
+        if available_width <= 20:
+            return
+
+        text = source_var.get().replace("\n", " ").strip()
+        if not text:
+            display_var.set("")
+            return
+
+        min_size = 6
+        base_size = 8
+        padding = 8
+
+        for size in range(base_size, min_size - 1, -1):
+            font.configure(size=size)
+            if font.measure(text) <= max(20, available_width - padding):
+                display_var.set(text)
+                return
+
+        font.configure(size=min_size)
+        truncated = text
+        while truncated and font.measure(truncated + "...") > max(20, available_width - padding):
+            truncated = truncated[:-1]
+        display_var.set((truncated + "...") if truncated else text)
 
     def _show_view(self, view_name: str) -> None:
         self.current_view = view_name
@@ -2471,56 +2687,60 @@ class StarStringsApp:
     def _reset_learned_blueprints_with_confirmation(self) -> None:
         state = load_state()
         learned_memory = state.learned_blueprint_memory or {}
-        if not learned_memory:
-            messagebox.showinfo(
-                APP_NAME,
-                "There are no saved learned blueprints to reset.\n\nIf your current game logs still contain unlocks, the next scan can rediscover them.",
-                parent=self.root,
+        status_overrides = state.blueprint_status_overrides or {}
+        if not learned_memory and not status_overrides:
+            self._show_themed_message_dialog(
+                title=APP_NAME,
+                heading="Nothing to Reset",
+                body="There are no saved learned blueprints or manual blueprint status overrides to reset.\n\nIf your current game logs still contain unlocks, the next scan can rediscover them.",
+                accent="#c09040",
             )
             return
 
-        confirm = messagebox.askyesno(
-            APP_NAME,
-            "This will clear the app's saved learned-blueprint memory.\n\n"
+        confirm = self._ask_themed_confirmation(
+            title=APP_NAME,
+            heading="Reset Learned Blueprints",
+            body="This will clear the app's saved learned-blueprint memory and any manual Learned/Missing blueprint status overrides.\n\n"
             "It will not touch your Star Citizen files, but the app will forget learned blueprints it has remembered.\n\n"
-            "If your current game logs still contain those unlock entries, a future scan can rediscover them.\n\n"
-            "Continue?",
-            parent=self.root,
+            "If your current game logs still contain those unlock entries, a future scan can rediscover them.",
+            confirm_text="Continue",
+            cancel_text="Keep Them",
         )
         if not confirm:
             return
 
-        confirm = messagebox.askyesno(
-            APP_NAME,
-            "Second checkpoint.\n\n"
-            "You are about to bonk the app's blueprint memory with a very large hammer.\n\n"
-            "Still feeling brave?",
-            parent=self.root,
+        confirm = self._ask_themed_confirmation(
+            title=APP_NAME,
+            heading="Second Checkpoint",
+            body="You are about to bonk the app's blueprint memory with a very large hammer.\n\nStill feeling brave?",
+            confirm_text="Yep",
+            cancel_text="Nope",
         )
         if not confirm:
             return
 
-        confirm = messagebox.askyesno(
-            APP_NAME,
-            "Third checkpoint.\n\n"
-            "Future-you may ask present-you why this seemed like such a good idea.\n\n"
-            "Proceed anyway?",
-            parent=self.root,
+        confirm = self._ask_themed_confirmation(
+            title=APP_NAME,
+            heading="Third Checkpoint",
+            body="Future-you may ask present-you why this seemed like such a good idea.\n\nProceed anyway?",
+            confirm_text="Absolutely",
+            cancel_text="Maybe Not",
         )
         if not confirm:
             return
 
-        confirm = messagebox.askyesno(
-            APP_NAME,
-            "Final checkpoint.\n\n"
-            "Tiny goblin with clipboard confirms you are wiping the saved learned-blueprint history.\n\n"
-            "Do the thing?",
-            parent=self.root,
+        confirm = self._ask_themed_confirmation(
+            title=APP_NAME,
+            heading="Final Checkpoint",
+            body="Tiny goblin with clipboard confirms you are wiping the saved learned-blueprint history and manual status overrides.\n\nDo the thing?",
+            confirm_text="Do It",
+            cancel_text="Abort",
         )
         if not confirm:
             return
 
         state.learned_blueprint_memory = {}
+        state.blueprint_status_overrides = {}
         save_state(state)
         self.state = state
         self.append_log("Saved learned blueprint memory was reset by the user.")
@@ -2624,9 +2844,9 @@ class StarStringsApp:
         self.blueprint_tree.delete(*self.blueprint_tree.get_children())
         self.filtered_blueprint_records = []
         for record in self.blueprint_records:
-            if filter_value == "Learned" and not record.learned:
+            if filter_value == "Learned" and record.status != "Learned":
                 continue
-            if filter_value == "Missing" and (record.learned or not record.contracts):
+            if filter_value == "Missing" and record.status != "Missing":
                 continue
             if type_filter != "All Types" and record.category != type_filter:
                 continue
@@ -2644,7 +2864,7 @@ class StarStringsApp:
                 "end",
                 iid=f"bp-{index}",
                 values=("🔗", record.name, record.category, record.status, "⚒"),
-                tags=("learned",) if record.learned else (),
+                tags=("learned",) if record.status == "Learned" else (),
             )
 
         if self.filtered_blueprint_records:
@@ -2717,6 +2937,7 @@ class StarStringsApp:
 
         - Column #1 (SC Wiki): open the wiki page for that row in a background thread.
         - Column #3 (Type): show an inline combobox overlay for changing the type override.
+        - Column #4 (Status): show an inline combobox overlay for changing the saved status override.
         Clicks on headings or outside rows are ignored so sorting commands still work.
         """
         region = self.blueprint_tree.identify_region(event.x, event.y)
@@ -2738,11 +2959,31 @@ class StarStringsApp:
             threading.Thread(target=worker, daemon=True).start()
         elif column == "#3":  # Type column
             self._show_inline_type_combobox(item_id, column, record)
+        elif column == "#4":  # Status column
+            self._show_inline_status_combobox(item_id, column, record)
         elif column == "#5":  # Materials column
             self._on_materials_click(record)
 
+    def _on_blueprint_tree_motion(self, event) -> None:
+        """Show a hand cursor over actionable blueprint cells."""
+        try:
+            region = self.blueprint_tree.identify_region(event.x, event.y)
+            column = self.blueprint_tree.identify_column(event.x)
+            item_id = self.blueprint_tree.identify_row(event.y)
+            actionable = region == "cell" and bool(item_id) and column in {"#1", "#3", "#4", "#5"}
+            self.blueprint_tree.configure(cursor="hand2" if actionable else "")
+        except Exception:
+            self.blueprint_tree.configure(cursor="")
+
     def _show_inline_type_combobox(self, item_id: str, column: str, record: BlueprintRecord) -> None:
         """Show a dark-themed popup listbox anchored below the Type cell."""
+        existing_popup = getattr(self, "_inline_editor_popup", None)
+        if existing_popup and existing_popup.winfo_exists():
+            try:
+                existing_popup.destroy()
+            except Exception:
+                pass
+
         bbox = self.blueprint_tree.bbox(item_id, column)
         if not bbox:
             return
@@ -2762,9 +3003,12 @@ class StarStringsApp:
 
         popup = tk.Toplevel(self.root)
         popup.overrideredirect(True)
+        popup.transient(self.root)
+        popup.wm_attributes("-topmost", True)
         popup.configure(bg="#c09040")          # 1 px gold border via padx/pady below
         popup.geometry(f"{popup_w}x{popup_h}+{abs_x}+{abs_y}")
         popup.lift()
+        self._inline_editor_popup = popup
 
         lb = tk.Listbox(
             popup,
@@ -2791,6 +3035,8 @@ class StarStringsApp:
 
         def _close(_event=None) -> None:
             try:
+                if getattr(self, "_inline_editor_popup", None) is popup:
+                    self._inline_editor_popup = None
                 popup.destroy()
             except Exception:
                 pass
@@ -2814,10 +3060,15 @@ class StarStringsApp:
             # the Toplevel and its child Listbox during initial show.
             popup.after(80, _close)
 
+        def on_parent_change(_event=None) -> None:
+            popup.after(0, _close)
+
         lb.bind("<Button-1>", on_pick)
         lb.bind("<Return>", on_pick)
         lb.bind("<Escape>", _close)
         lb.bind("<FocusOut>", on_focus_out)
+        self.root.bind("<Configure>", on_parent_change, add="+")
+        self.root.bind("<FocusIn>", on_parent_change, add="+")
 
         popup.focus_force()
         lb.focus_set()
@@ -2834,6 +3085,115 @@ class StarStringsApp:
             self.state.blueprint_category_overrides[record.normalized_name] = override
         else:
             self.state.blueprint_category_overrides.pop(record.normalized_name, None)
+        save_state(self.state)
+        self._refresh_blueprint_list()
+
+    def _show_inline_status_combobox(self, item_id: str, column: str, record: BlueprintRecord) -> None:
+        """Show a dark-themed popup listbox anchored below the Status cell."""
+        existing_popup = getattr(self, "_inline_editor_popup", None)
+        if existing_popup and existing_popup.winfo_exists():
+            try:
+                existing_popup.destroy()
+            except Exception:
+                pass
+
+        bbox = self.blueprint_tree.bbox(item_id, column)
+        if not bbox:
+            return
+        x, y, cell_w, cell_h = bbox
+
+        abs_x = self.blueprint_tree.winfo_rootx() + x
+        abs_y = self.blueprint_tree.winfo_rooty() + y + cell_h
+
+        status_options = ("Auto", "Learned", "Missing")
+        item_h = 22
+        popup_w = max(cell_w, 150)
+        popup_h = len(status_options) * item_h + 2
+
+        screen_h = self.root.winfo_screenheight()
+        if abs_y + popup_h > screen_h - 40:
+            abs_y = self.blueprint_tree.winfo_rooty() + y - popup_h
+
+        popup = tk.Toplevel(self.root)
+        popup.overrideredirect(True)
+        popup.transient(self.root)
+        popup.wm_attributes("-topmost", True)
+        popup.configure(bg="#c09040")
+        popup.geometry(f"{popup_w}x{popup_h}+{abs_x}+{abs_y}")
+        popup.lift()
+        self._inline_editor_popup = popup
+
+        lb = tk.Listbox(
+            popup,
+            bg="#0d1219",
+            fg="#e8edf2",
+            selectbackground="#c09040",
+            selectforeground="#080c10",
+            relief="flat",
+            font=("Segoe UI", 9),
+            bd=0,
+            highlightthickness=0,
+            activestyle="none",
+            exportselection=False,
+        )
+        lb.pack(fill="both", expand=True, padx=1, pady=1)
+
+        current = record.status_override or "Auto"
+        for i, option in enumerate(status_options):
+            lb.insert("end", f"  {option}")
+            if option == current:
+                lb.selection_set(i)
+                lb.activate(i)
+                lb.see(i)
+
+        def _close(_event=None) -> None:
+            try:
+                if getattr(self, "_inline_editor_popup", None) is popup:
+                    self._inline_editor_popup = None
+                popup.destroy()
+            except Exception:
+                pass
+
+        def on_pick(event=None) -> None:
+            if event is not None:
+                idx = lb.nearest(event.y)
+            else:
+                sel = lb.curselection()
+                idx = sel[0] if sel else -1
+            if idx < 0 or idx >= lb.size():
+                return
+            choice = lb.get(idx).strip()
+            _close()
+            self._apply_status_override(record, choice)
+
+        def on_focus_out(_event=None) -> None:
+            popup.after(80, _close)
+
+        def on_parent_change(_event=None) -> None:
+            popup.after(0, _close)
+
+        lb.bind("<Button-1>", on_pick)
+        lb.bind("<Return>", on_pick)
+        lb.bind("<Escape>", _close)
+        lb.bind("<FocusOut>", on_focus_out)
+        self.root.bind("<Configure>", on_parent_change, add="+")
+        self.root.bind("<FocusIn>", on_parent_change, add="+")
+
+        popup.focus_force()
+        lb.focus_set()
+
+    def _apply_status_override(self, record: BlueprintRecord, choice: str) -> None:
+        """Persist a user-chosen status override for a blueprint record."""
+        override = "" if choice == "Auto" else choice
+        if override == record.status_override:
+            return
+        record.status_override = override
+        if self.state.blueprint_status_overrides is None:
+            self.state.blueprint_status_overrides = {}
+        if override:
+            self.state.blueprint_status_overrides[record.normalized_name] = override
+        else:
+            self.state.blueprint_status_overrides.pop(record.normalized_name, None)
         save_state(self.state)
         self._refresh_blueprint_list()
 
