@@ -40,7 +40,7 @@ LEGACY_TASK_NAMES = (
 DEFAULT_LIVE_PATH = r"C:\Program Files\Roberts Space Industries\StarCitizen\LIVE"
 DEFAULT_REPO = "https://github.com/MrKraken/StarStrings"
 APP_UPDATE_REPO = "aj3/CitizenStarStringHelper-v2"
-APP_VERSION = "2.2.2"
+APP_VERSION = "2.2.3"
 APP_UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000
 BLUEPRINT_SCAN_INTERVAL_MS = 15 * 60 * 1000
 LANGUAGE_LINE = "g_language = english."
@@ -239,6 +239,7 @@ class State:
     blueprints_last_scanned_release_id: str = ""
     blueprints_last_scanned_release_name: str = ""
     blueprint_category_overrides: dict[str, str] | None = None
+    learned_blueprint_memory: dict[str, str] | None = None
 
 
 @dataclass
@@ -694,6 +695,11 @@ def load_state() -> State:
                 for key, value in (data.get("blueprint_category_overrides") or {}).items()
                 if isinstance(key, str) and isinstance(value, str)
             },
+            learned_blueprint_memory={
+                str(key): str(value)
+                for key, value in (data.get("learned_blueprint_memory") or {}).items()
+                if isinstance(key, str) and isinstance(value, str)
+            },
         )
     except Exception as exc:
         log(f"Failed to load state, using empty state. {exc}")
@@ -713,6 +719,7 @@ def save_state(state: State) -> None:
                 "blueprints_last_scanned_release_id": state.blueprints_last_scanned_release_id,
                 "blueprints_last_scanned_release_name": state.blueprints_last_scanned_release_name,
                 "blueprint_category_overrides": state.blueprint_category_overrides or {},
+                "learned_blueprint_memory": state.learned_blueprint_memory or {},
             },
             indent=2,
         ),
@@ -857,6 +864,20 @@ def collect_blueprint_records(live_path: str) -> tuple[list[BlueprintRecord], di
     learned_records, log_paths = parse_learned_blueprints(live_path)
     state = load_state()
     overrides = state.blueprint_category_overrides or {}
+    learned_memory = state.learned_blueprint_memory or {}
+
+    for key, saved_name in learned_memory.items():
+        normalized = normalize_search_text(key)
+        if not normalized:
+            continue
+        record = learned_records.setdefault(
+            normalized,
+            {"name": saved_name, "count": 0, "sources": set()},
+        )
+        if not record.get("name"):
+            record["name"] = saved_name
+        record["count"] = max(int(record.get("count") or 0), 1)
+        record["sources"].add("Saved in app memory")
 
     all_keys = sorted(set(starstrings_records) | set(learned_records))
     results: list[BlueprintRecord] = []
@@ -1410,7 +1431,6 @@ class StarStringsApp:
         self.blueprint_search_var = StringVar(value="")
         self.blueprint_filter_var = StringVar(value="All")
         self.blueprint_type_filter_var = StringVar(value="All Types")
-        self.blueprint_search_mode_var = StringVar(value="Strict")
         self.blueprint_status_var = StringVar(value="Scan your StarStrings data to see available and learned blueprints.")
         self.blueprint_summary_var = StringVar(value="No blueprint scan has been run yet.")
         self.blueprint_detail_title_var = StringVar(value="Select a blueprint")
@@ -1964,7 +1984,8 @@ class StarStringsApp:
         btn_row = tk.Frame(dialog, bg="#0d1219")
         btn_row.grid(row=2, column=0, sticky="ew", padx=28, pady=(0, 22))
         btn_row.columnconfigure(0, weight=1)
-        btn_row.columnconfigure(1, weight=1)
+        btn_row.columnconfigure(1, minsize=12)
+        btn_row.columnconfigure(2, weight=1)
 
         def do_minimize() -> None:
             result["action"] = "minimize"
@@ -1977,11 +1998,11 @@ class StarStringsApp:
         tk.Button(btn_row, text="Minimize to Tray", command=do_minimize,
                   bg="#162030", fg="#e8edf2", activebackground="#1e2d3d", activeforeground="#e8edf2",
                   relief="flat", padx=14, pady=8, font=("Segoe UI Semibold", 9),
-                  cursor="hand2", bd=0).grid(row=0, column=0, sticky="ew", padx=(0, 10))
+                  cursor="hand2", bd=0).grid(row=0, column=0, sticky="ew")
         tk.Button(btn_row, text="Exit", command=do_exit,
                   bg="#c09040", fg="#080c10", activebackground="#d4a84e", activeforeground="#080c10",
                   relief="flat", padx=14, pady=8, font=("Segoe UI Semibold", 9),
-                  cursor="hand2", bd=0).grid(row=0, column=1, sticky="ew")
+                  cursor="hand2", bd=0).grid(row=0, column=2, sticky="ew")
 
         dialog.update_idletasks()
         width = max(dialog.winfo_width(), 430)
@@ -2045,12 +2066,12 @@ class StarStringsApp:
         view_row.columnconfigure(0, weight=0)
         view_row.columnconfigure(1, weight=0)
         view_row.columnconfigure(2, weight=0)
-        self.setup_view_button = ttk.Button(view_row, text="SETUP", style="ViewActive.TButton", command=lambda: self._show_view("setup"))
+        self.setup_view_button = ttk.Button(view_row, text="STARSTRINGS", style="ViewActive.TButton", command=lambda: self._show_view("setup"))
         self.setup_view_button.grid(row=0, column=0, padx=(0, 8))
-        self.activity_view_button = ttk.Button(view_row, text="ACTIVITY", style="ViewIdle.TButton", command=lambda: self._show_view("activity"))
-        self.activity_view_button.grid(row=0, column=1, padx=(0, 8))
         self.blueprints_view_button = ttk.Button(view_row, text="BLUEPRINTS", style="ViewIdle.TButton", command=lambda: self._show_view("blueprints"))
-        self.blueprints_view_button.grid(row=0, column=2)
+        self.blueprints_view_button.grid(row=0, column=1, padx=(0, 8))
+        self.activity_view_button = ttk.Button(view_row, text="CONSOLE", style="ViewIdle.TButton", command=lambda: self._show_view("activity"))
+        self.activity_view_button.grid(row=0, column=2)
 
         # Gold accent line between header and content (RSI nav-bar style)
         tk.Frame(root_frame, bg="#c09040", height=1).grid(row=1, column=0, sticky="ew", pady=(0, 14))
@@ -2126,6 +2147,9 @@ class StarStringsApp:
         self.toggle_button.grid(row=0, column=1, sticky="ew")
         restore_button = ttk.Button(button_row, text="Restore Previous Backup", style="Secondary.TButton", command=self._open_restore_backup_dialog)
         restore_button.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        schedule_inline_label = ttk.Label(button_row, textvariable=self.schedule_var, style="Muted.TLabel", wraplength=860, justify="left")
+        schedule_inline_label.grid(row=2, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        self.meta_labels.append(schedule_inline_label)
 
         footer_bar = tk.Frame(footer, bg="#080c10")
         footer_bar.grid(row=0, column=0, sticky="ew")
@@ -2178,7 +2202,7 @@ class StarStringsApp:
         feed_card = ttk.Frame(activity, style="Card.TFrame", padding=20)
         feed_card.grid(row=0, column=0, sticky="nsew")
         feed_card.columnconfigure(0, weight=1)
-        feed_card.rowconfigure(5, weight=1)
+        feed_card.rowconfigure(4, weight=1)
 
         ttk.Label(feed_card, text="Operations Feed", style="SectionTitle.TLabel").grid(row=0, column=0, sticky="w")
         activity_button_row = ttk.Frame(feed_card, style="Card.TFrame")
@@ -2197,6 +2221,7 @@ class StarStringsApp:
         ttk.Button(activity_button_row, text="Open App Folder", style="Secondary.TButton", command=self._open_current_app_folder).grid(row=0, column=1, sticky="ew", padx=(8, 0), pady=(0, 8))
         ttk.Button(activity_button_row, text="Open Log Folder", style="Secondary.TButton", command=self._open_log_folder).grid(row=1, column=0, sticky="ew", padx=(0, 8))
         ttk.Button(activity_button_row, text="Clear Log", style="Secondary.TButton", command=self._clear_log).grid(row=1, column=1, sticky="ew", padx=(8, 0))
+        ttk.Button(activity_button_row, text="Reset Learned Blueprints", style="Secondary.TButton", command=self._reset_learned_blueprints_with_confirmation).grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
 
         ops_meta = ttk.Label(feed_card, textvariable=self.operations_meta_var, style="Muted.TLabel", wraplength=860, justify="left")
         ops_meta.grid(row=2, column=0, sticky="w", pady=(0, 2))
@@ -2204,15 +2229,11 @@ class StarStringsApp:
         app_path_label = ttk.Label(feed_card, textvariable=self.current_app_path_var, style="Muted.TLabel", wraplength=860, justify="left")
         app_path_label.grid(row=3, column=0, sticky="w", pady=(0, 2))
         self.meta_labels.append(app_path_label)
-        schedule_label = ttk.Label(feed_card, textvariable=self.schedule_var, style="Muted.TLabel", wraplength=860, justify="left")
-        schedule_label.grid(row=4, column=0, sticky="w", pady=(0, 10))
-        self.meta_labels.append(schedule_label)
-
         self.log_text = ttk.Treeview(feed_card, show="", height=8)
         self.log_text.grid_remove()
 
         self.log_widget = tk.Text(feed_card, height=10, wrap="word", bg="#080c10", fg="#e8edf2", insertbackground="#e8edf2", relief="flat", font=("Consolas", 9), padx=10, pady=8)
-        self.log_widget.grid(row=5, column=0, sticky="nsew")
+        self.log_widget.grid(row=4, column=0, sticky="nsew")
         self.log_widget.tag_configure("ts",      foreground="#5a4418")  # dim gold timestamp
         self.log_widget.tag_configure("info",    foreground="#e8edf2")  # normal
         self.log_widget.tag_configure("success", foreground="#4ade80")  # green
@@ -2261,21 +2282,10 @@ class StarStringsApp:
         )
         self.blueprint_type_filter_combo.grid(row=2, column=5, sticky="ew", padx=(0, 12))
         self.blueprint_type_filter_combo.bind("<<ComboboxSelected>>", lambda _event: self._refresh_blueprint_list())
-        ttk.Label(bp_toolbar, text="MODE", style="SmallAccent.TLabel").grid(row=2, column=6, sticky="w", padx=(0, 10))
-        self.blueprint_search_mode_combo = ttk.Combobox(
-            bp_toolbar,
-            state="readonly",
-            values=("Strict", "Fuzzy"),
-            textvariable=self.blueprint_search_mode_var,
-            width=10,
-            font=("Segoe UI", 9),
-        )
-        self.blueprint_search_mode_combo.grid(row=2, column=7, sticky="ew", padx=(0, 12))
-        self.blueprint_search_mode_combo.bind("<<ComboboxSelected>>", lambda _event: self._refresh_blueprint_list())
         self.blueprint_scan_button = ttk.Button(bp_toolbar, text="Scan Blueprints", style="Primary.TButton", command=self.scan_blueprints)
-        self.blueprint_scan_button.grid(row=2, column=9, sticky="ew")
+        self.blueprint_scan_button.grid(row=2, column=6, sticky="ew")
 
-        ttk.Label(bp_toolbar, textvariable=self.blueprint_status_var, style="Muted.TLabel").grid(row=3, column=0, columnspan=10, sticky="w", pady=(12, 0))
+        ttk.Label(bp_toolbar, textvariable=self.blueprint_status_var, style="Muted.TLabel").grid(row=3, column=0, columnspan=7, sticky="w", pady=(12, 0))
 
         bp_summary = ttk.Frame(blueprints, style="Card.TFrame", padding=12)
         bp_summary.grid(row=1, column=0, sticky="ew", pady=(0, 12))
@@ -2458,6 +2468,64 @@ class StarStringsApp:
         self.log_widget.delete("1.0", "end")
         self.log_widget.configure(state="disabled")
 
+    def _reset_learned_blueprints_with_confirmation(self) -> None:
+        state = load_state()
+        learned_memory = state.learned_blueprint_memory or {}
+        if not learned_memory:
+            messagebox.showinfo(
+                APP_NAME,
+                "There are no saved learned blueprints to reset.\n\nIf your current game logs still contain unlocks, the next scan can rediscover them.",
+                parent=self.root,
+            )
+            return
+
+        confirm = messagebox.askyesno(
+            APP_NAME,
+            "This will clear the app's saved learned-blueprint memory.\n\n"
+            "It will not touch your Star Citizen files, but the app will forget learned blueprints it has remembered.\n\n"
+            "If your current game logs still contain those unlock entries, a future scan can rediscover them.\n\n"
+            "Continue?",
+            parent=self.root,
+        )
+        if not confirm:
+            return
+
+        confirm = messagebox.askyesno(
+            APP_NAME,
+            "Second checkpoint.\n\n"
+            "You are about to bonk the app's blueprint memory with a very large hammer.\n\n"
+            "Still feeling brave?",
+            parent=self.root,
+        )
+        if not confirm:
+            return
+
+        confirm = messagebox.askyesno(
+            APP_NAME,
+            "Third checkpoint.\n\n"
+            "Future-you may ask present-you why this seemed like such a good idea.\n\n"
+            "Proceed anyway?",
+            parent=self.root,
+        )
+        if not confirm:
+            return
+
+        confirm = messagebox.askyesno(
+            APP_NAME,
+            "Final checkpoint.\n\n"
+            "Tiny goblin with clipboard confirms you are wiping the saved learned-blueprint history.\n\n"
+            "Do the thing?",
+            parent=self.root,
+        )
+        if not confirm:
+            return
+
+        state.learned_blueprint_memory = {}
+        save_state(state)
+        self.state = state
+        self.append_log("Saved learned blueprint memory was reset by the user.")
+        self.scan_blueprints(silent=False)
+
     def _schedule_blueprint_auto_scan(self) -> None:
         if self.blueprint_auto_scan_job is not None:
             try:
@@ -2515,6 +2583,11 @@ class StarStringsApp:
         self.state.blueprints_last_scanned_at = str(metadata.get("scanned_at") or datetime.now().isoformat())
         self.state.blueprints_last_scanned_release_id = str(metadata.get("tracked_release_id") or "")
         self.state.blueprints_last_scanned_release_name = str(metadata.get("tracked_release_name") or "")
+        memory = dict(self.state.learned_blueprint_memory or {})
+        for record in records:
+            if record.learned:
+                memory[record.normalized_name] = record.name
+        self.state.learned_blueprint_memory = memory
         save_state(self.state)
         total = int(metadata.get("total_count") or 0)
         learned = int(metadata.get("learned_count") or 0)
@@ -2547,7 +2620,6 @@ class StarStringsApp:
         query = normalize_search_text(self.blueprint_search_var.get())
         filter_value = self.blueprint_filter_var.get().strip() or "All"
         type_filter = self.blueprint_type_filter_var.get().strip() or "All Types"
-        search_mode = (self.blueprint_search_mode_var.get().strip() or "Strict").lower()
 
         self.blueprint_tree.delete(*self.blueprint_tree.get_children())
         self.filtered_blueprint_records = []
@@ -2560,12 +2632,8 @@ class StarStringsApp:
                 continue
             if query:
                 haystack = normalize_search_text(" ".join([record.name, record.category, *record.contracts]))
-                if search_mode == "strict":
-                    if query not in haystack:
-                        continue
-                else:
-                    if not fuzzy_query_match(query, haystack):
-                        continue
+                if query not in haystack:
+                    continue
             self.filtered_blueprint_records.append(record)
 
         self._sort_filtered_blueprint_records()
@@ -2932,7 +3000,7 @@ class StarStringsApp:
     def _set_activity_badge(self, active: bool) -> None:
         if not hasattr(self, "activity_view_button"):
             return
-        text = "ACTIVITY  ●" if active else "ACTIVITY"
+        text = "CONSOLE  ●" if active else "CONSOLE"
         idle_style = "ViewIdleBadge.TButton" if active else "ViewIdle.TButton"
         self.activity_view_button.configure(text=text)
         if self.current_view != "activity":
