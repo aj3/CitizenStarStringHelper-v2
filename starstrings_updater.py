@@ -39,7 +39,7 @@ LEGACY_TASK_NAMES = (
 DEFAULT_LIVE_PATH = r"C:\Program Files\Roberts Space Industries\StarCitizen\LIVE"
 DEFAULT_REPO = "https://github.com/MrKraken/StarStrings"
 APP_UPDATE_REPO = "aj3/CitizenStarStringHelper-v2"
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.1.1"
 APP_UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000
 BLUEPRINT_SCAN_INTERVAL_MS = 15 * 60 * 1000
 LANGUAGE_LINE = "g_language = english."
@@ -2532,50 +2532,94 @@ class StarStringsApp:
             self._show_inline_type_combobox(item_id, column, record)
 
     def _show_inline_type_combobox(self, item_id: str, column: str, record: BlueprintRecord) -> None:
-        """Place a Combobox widget directly over the Type cell for inline editing."""
+        """Show a dark-themed popup listbox anchored below the Type cell."""
         bbox = self.blueprint_tree.bbox(item_id, column)
         if not bbox:
             return
-        x, y, width, height = bbox
+        x, y, cell_w, cell_h = bbox
 
-        combo = ttk.Combobox(
-            self.blueprint_tree,
-            values=BLUEPRINT_CATEGORY_OPTIONS,
-            state="readonly",
+        abs_x = self.blueprint_tree.winfo_rootx() + x
+        abs_y = self.blueprint_tree.winfo_rooty() + y + cell_h
+
+        ITEM_H = 22
+        popup_w = max(cell_w, 150)
+        popup_h = len(BLUEPRINT_CATEGORY_OPTIONS) * ITEM_H + 2
+
+        # Flip above the cell if popup would clip below the screen
+        screen_h = self.root.winfo_screenheight()
+        if abs_y + popup_h > screen_h - 40:
+            abs_y = self.blueprint_tree.winfo_rooty() + y - popup_h
+
+        popup = tk.Toplevel(self.root)
+        popup.overrideredirect(True)
+        popup.configure(bg="#c09040")          # 1 px gold border via padx/pady below
+        popup.geometry(f"{popup_w}x{popup_h}+{abs_x}+{abs_y}")
+        popup.lift()
+
+        lb = tk.Listbox(
+            popup,
+            bg="#0d1219",
+            fg="#e8edf2",
+            selectbackground="#c09040",
+            selectforeground="#080c10",
+            relief="flat",
             font=("Segoe UI", 9),
+            bd=0,
+            highlightthickness=0,
+            activestyle="none",
+            exportselection=False,
         )
-        combo.set(record.category_override or "Auto")
-        combo.place(x=x, y=y, width=width, height=height)
-        combo.focus_set()
-        # Trigger dropdown open after the widget is rendered
-        combo.after(40, lambda: combo.event_generate("<Button-1>"))
+        lb.pack(fill="both", expand=True, padx=1, pady=1)
 
-        def on_select(_event=None) -> None:
-            choice = combo.get()
-            _dismiss()
-            override = "" if choice == "Auto" else choice
-            if override == record.category_override:
-                return
-            record.category_override = override
-            if self.state.blueprint_category_overrides is None:
-                self.state.blueprint_category_overrides = {}
-            if override:
-                self.state.blueprint_category_overrides[record.normalized_name] = override
-            else:
-                self.state.blueprint_category_overrides.pop(record.normalized_name, None)
-            save_state(self.state)
-            self._refresh_blueprint_list()
+        current = record.category_override or "Auto"
+        for i, option in enumerate(BLUEPRINT_CATEGORY_OPTIONS):
+            lb.insert("end", f"  {option}")
+            if option == current:
+                lb.selection_set(i)
+                lb.activate(i)
+                lb.see(i)
 
-        def _dismiss(_event=None) -> None:
+        def _close(_event=None) -> None:
             try:
-                combo.place_forget()
-                combo.destroy()
+                popup.destroy()
             except Exception:
                 pass
 
-        combo.bind("<<ComboboxSelected>>", on_select)
-        combo.bind("<FocusOut>", _dismiss)
-        combo.bind("<Escape>", _dismiss)
+        def on_pick(_event=None) -> None:
+            sel = lb.curselection()
+            _close()
+            if not sel:
+                return
+            choice = lb.get(sel[0]).strip()
+            self._apply_type_override(record, choice)
+
+        def on_focus_out(_event=None) -> None:
+            # Small delay prevents premature dismiss when focus shifts between
+            # the Toplevel and its child Listbox during initial show.
+            popup.after(80, _close)
+
+        lb.bind("<ButtonRelease-1>", on_pick)
+        lb.bind("<Return>", on_pick)
+        lb.bind("<Escape>", _close)
+        lb.bind("<FocusOut>", on_focus_out)
+
+        popup.focus_force()
+        lb.focus_set()
+
+    def _apply_type_override(self, record: BlueprintRecord, choice: str) -> None:
+        """Persist a user-chosen type override for a blueprint record."""
+        override = "" if choice == "Auto" else choice
+        if override == record.category_override:
+            return
+        record.category_override = override
+        if self.state.blueprint_category_overrides is None:
+            self.state.blueprint_category_overrides = {}
+        if override:
+            self.state.blueprint_category_overrides[record.normalized_name] = override
+        else:
+            self.state.blueprint_category_overrides.pop(record.normalized_name, None)
+        save_state(self.state)
+        self._refresh_blueprint_list()
 
     def _schedule_blueprint_search(self) -> None:
         """Debounce blueprint search box keystrokes (150 ms) to avoid O(n) work per key."""
