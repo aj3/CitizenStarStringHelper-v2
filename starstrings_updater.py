@@ -40,7 +40,7 @@ LEGACY_TASK_NAMES = (
 DEFAULT_LIVE_PATH = r"C:\Program Files\Roberts Space Industries\StarCitizen\LIVE"
 DEFAULT_REPO = "https://github.com/MrKraken/StarStrings"
 APP_UPDATE_REPO = "aj3/CitizenStarStringHelper-v2"
-APP_VERSION = "2.2.0"
+APP_VERSION = "2.2.1"
 APP_UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000
 BLUEPRINT_SCAN_INTERVAL_MS = 15 * 60 * 1000
 LANGUAGE_LINE = "g_language = english."
@@ -389,18 +389,19 @@ def resolve_blueprint_wiki_url(name: str) -> str:
 
 
 def format_scu(value: float) -> str:
-    """Format an SCU quantity from the crafting DB, removing float imprecision.
+    """Format an SCU quantity from the crafting DB as SCU or µSCU.
 
-    In SC crafting, 1 µSCU = 0.01 SCU — all quantities in the community DB are
-    exact multiples of 0.01 SCU stored as imprecise floats (0.02999999933 → 3 µSCU).
-    Values ≥ 1 SCU are shown as SCU; smaller values as whole µSCU numbers.
+    1 µSCU = 0.000001 SCU (1 SCU = 1,000,000 µSCU).
+    - Values < 1 SCU are expressed in µSCU (always whole numbers for DB values).
+    - Values ≥ 1 SCU are expressed in SCU using :g format (no trailing zeros).
+    Float noise is removed before conversion (0.02999999933 → 30,000 µSCU).
     """
-    clean = round(value, 4)
+    clean = round(value, 6)
     if clean <= 0:
         return "0 µSCU"
     if clean < 1.0:
-        muscu = round(clean * 100)
-        return f"{muscu} µSCU" if muscu > 0 else f"{clean:.4g} SCU"
+        muscu = round(clean * 1_000_000)
+        return f"{muscu:,} µSCU"
     return f"{clean:g} SCU"
 
 
@@ -2726,12 +2727,18 @@ class StarStringsApp:
             except Exception:
                 pass
 
-        def on_pick(_event=None) -> None:
-            sel = lb.curselection()
-            _close()
-            if not sel:
+        def on_pick(event=None) -> None:
+            # Use nearest() so we don't depend on curselection() being set —
+            # more reliable than <ButtonRelease-1> on Windows overrideredirect windows.
+            if event is not None:
+                idx = lb.nearest(event.y)
+            else:
+                sel = lb.curselection()
+                idx = sel[0] if sel else -1
+            if idx < 0 or idx >= lb.size():
                 return
-            choice = lb.get(sel[0]).strip()
+            choice = lb.get(idx).strip()
+            _close()
             self._apply_type_override(record, choice)
 
         def on_focus_out(_event=None) -> None:
@@ -2739,7 +2746,7 @@ class StarStringsApp:
             # the Toplevel and its child Listbox during initial show.
             popup.after(80, _close)
 
-        lb.bind("<ButtonRelease-1>", on_pick)
+        lb.bind("<Button-1>", on_pick)
         lb.bind("<Return>", on_pick)
         lb.bind("<Escape>", _close)
         lb.bind("<FocusOut>", on_focus_out)
@@ -2885,7 +2892,9 @@ class StarStringsApp:
         y = self.root.winfo_y() + (self.root.winfo_height() - h) // 2
         dialog.geometry(f"{w}x{h}+{x}+{y}")
         apply_dark_titlebar(dialog)
+        dialog.bind("<Escape>", lambda _e: dialog.destroy())
         dialog.grab_set()
+        dialog.focus_force()
 
     def _schedule_blueprint_search(self) -> None:
         """Debounce blueprint search box keystrokes (150 ms) to avoid O(n) work per key."""
